@@ -175,6 +175,10 @@ namespace Splat2Play.Editor
                     var driver = go.AddComponent<S2PLightModulationDriver>();
                     driver.Flashlight = flashlight;
                     driver.SetGlobalsNow();
+                    go.AddComponent<S2PPerfPanel>();
+                    var streaming = go.AddComponent<S2PSplatStreaming>();
+                    streaming.Target = renderer;
+                    streaming.Camera = cam;
                     // GS 渲染选项:Stochastic + Reprojected(包默认),splat 深度缓冲才有值
                     GaussianSplatting.Runtime.GaussianSplatRenderingOptions.instance.m_Transparency =
                         GaussianSplatting.Runtime.TransparencyMode.Stochastic;

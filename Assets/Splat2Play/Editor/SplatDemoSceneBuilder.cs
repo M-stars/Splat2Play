@@ -74,6 +74,12 @@ namespace Splat2Play.Editor
             var level = levelGo.AddComponent<SplatLevel>();
             level.SplatRenderer = renderer;
             levelGo.AddComponent<NavMeshSurface>();    // T2.1:烘焙源=代理网格(装配后手动 Bake)
+            var panel = levelGo.AddComponent<S2PPerfPanel>();
+            panel.SplatRenderer = renderer;
+            var streaming = levelGo.AddComponent<S2PSplatStreaming>();
+            streaming.Target = renderer;
+            streaming.FullDistance = 20f;
+            streaming.CullDistance = 80f;
 
             // —— 玩家 ——
             var player = GameObject.CreatePrimitive(PrimitiveType.Capsule);
