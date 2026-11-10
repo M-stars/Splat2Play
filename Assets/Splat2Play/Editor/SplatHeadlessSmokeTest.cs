@@ -79,6 +79,13 @@ namespace Splat2Play.Editor
                 Debug.Log($"[S2P] 加载完成 {renderer.splatCount:N0} splats");
 
                 // 4. 相机渲染一张远景图(验证 splat 真实出现在画面里)
+                // 参照方块:验证 URP 批处理下不透明网格是否正常渲染
+                var refCube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                refCube.name = "RefCube";
+                var cubeb = renderer.localBounds;
+                refCube.transform.position = cubeb.center + new Vector3(0f, cubeb.size.y * 0.05f, -cubeb.size.z * 0.28f);
+                refCube.transform.localScale = Vector3.one * (cubeb.size.magnitude * 0.04f);
+
                 var camGo = new GameObject("Cam");
                 var cam = camGo.AddComponent<Camera>();
                 var b = renderer.localBounds;
@@ -145,8 +152,25 @@ namespace Splat2Play.Editor
 
                     level.ShowCollisionDebug = true;
                     level.BuildCollision();
+                    renderer.enabled = false;
                     float nb2 = CapturePng(cam, Path.Combine(OutDir, "render_collision.png"));
+                    renderer.enabled = true;
                     log.AppendLine($"近景(碰撞调试): 非黑像素 {nb2:P1} → render_collision.png");
+
+                    // 几何验证(camera.Render() 在 URP 下不画不透明网格 → 用 Raycast 证明碰撞体工作)
+                    var probe = sb.center + new Vector3(0f, Mathf.Min(1.6f, sb.size.y * 0.3f), 0f);
+                    int hitCount = 0;
+                    var dirs = new[] { Vector3.down, Vector3.up, Vector3.forward, Vector3.back, Vector3.left, Vector3.right };
+                    foreach (var d in dirs)
+                    {
+                        if (Physics.Raycast(probe, d, out var hit, 100f))
+                        {
+                            ++hitCount;
+                            log.AppendLine($"[碰撞验证] {d} → 命中 {hit.collider.name} 距离 {hit.distance:F2}m");
+                        }
+                        else log.AppendLine($"[碰撞验证] {d} → 未命中");
+                    }
+                    log.AppendLine($"[碰撞验证] 命中 {hitCount}/6 方向");
                 }
 
                 // 7. 写 benchmark 数据
@@ -162,7 +186,9 @@ namespace Splat2Play.Editor
                 {
                     string assetDir = "Assets/Splat2Play/Baked";
                     if (!AssetDatabase.IsValidFolder(assetDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
-                    string assetPath = AssetDatabase.GenerateUniqueAssetPath($"{assetDir}/smoke_Proxy.asset");
+                    string assetPath = $"{assetDir}/smoke_Proxy.asset";
+                    var existing = AssetDatabase.LoadAssetAtPath<ProxyData>(assetPath);
+                    if (existing != null) AssetDatabase.DeleteAsset(assetPath);
                     AssetDatabase.CreateAsset(proxy, assetPath);
                     AssetDatabase.AddObjectToAsset(bakeResult.Mesh, proxy);
                     EditorUtility.SetDirty(proxy);
