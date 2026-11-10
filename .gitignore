@@ -1,0 +1,47 @@
+# === Unity ===
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+[Rr]ecordings/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.apk
+*.aab
+*.unitypackage
+*.app
+crashlytics-build.properties
+
+# === IDE ===
+.idea/
+.vscode/
+.vs/
+
+# === OS ===
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# === Large capture data ===
+# Scan/splat files stay out of git (use external storage or Git LFS later)
+*.ply
+*.spz
+*.sog
+*.ksplat
+*.zip
+*.7z
+*.tar.gz
