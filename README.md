@@ -1,64 +1,45 @@
-# Splat2Play
+# Splat2Play(实境入戏)
 
-> **Scan reality. Play it.** — turn real-world 3D Gaussian Splatting captures into playable levels in Unity.
->
-> 中文:**实境入戏** —— 把真实世界的 3DGS 扫描变成 Unity 里可玩的关卡。
+> **扫描现实,即刻可玩。** —— 把真实世界的 3D 高斯泼溅(3DGS)扫描,变成 Unity 里可玩的关卡。
 
-**Status:** 🚧 design phase — code lands starting M0 (see [ROADMAP.md](ROADMAP.md))
+**状态:** 🚧 设计阶段,代码自 M0 起逐步落地(见 [ROADMAP.md](ROADMAP.md) 与 [docs/项目书.md](docs/项目书.md))
 
-## Why
+## 为什么做这个
 
-Game engines expect levels to be meshes: colliders, navmesh, lights, occlusion culling. 3D Gaussian Splatting (3DGS) delivers photoreal captures of real places in hours instead of weeks of art time — but out of the box, a splat scene is "a photo you can move around": nothing collides, nothing navigates, nothing responds to light.
+游戏引擎默认关卡是网格:要有碰撞体、导航网格、光照、遮挡剔除。3DGS 用几小时的采集就能得到照片级的真实场景(传统手工制作需要数周到数月的美术工时)——但开箱即用的 splat 场景只是"一张能移动的照片":不能碰撞、不能寻路、不响应光照。
 
-Splat2Play is a Unity toolchain that generates the game-facing layers a scanned scene is missing, so a captured street corner can ship as an actual game level.
+Splat2Play 是一套 Unity 工具链,为扫描场景补齐游戏引擎要求的全部"接入层",让一段真实扫描的街角可以作为真正的游戏关卡交付。
 
-## Modules
+## 模块
 
-| Module | What it does |
+| 模块 | 功能 |
 |---|---|
-| **Proxy Collider Generation** | Voxelize splat density → flood fill → SDF → decimated collision mesh → Unity colliders |
-| **NavMesh Bridge** | Proxy mesh drives Unity NavMesh, so AI agents navigate scanned environments |
-| **Approximate Dynamic Lighting** | A depth-only proxy pass lets splats approximately receive scene shadows and dynamic lights — no re-training required |
-| **Chunk Streaming & Culling** | Chunked rendering with proxy-driven occlusion culling and a runtime memory panel |
+| **碰撞代理生成** | splat 密度场体素化 → 洪泛填充 → SDF → 抽稀碰撞网格 → Unity Collider |
+| **NavMesh 桥接** | 代理网格直出 Unity NavMesh,敌人 AI 可在扫描街道上寻路 |
+| **近似动态光照** | depth-only 代理 pass 让 splat 近似接收场景阴影与动态光源,无需重训练 |
+| **分块流送与剔除** | chunk 渲染 + 基于代理的遮挡剔除 + 运行时内存面板 |
 
-## Target demo
+## 目标 Demo
 
-A first-person micro-level inside a real scanned street corner: the player collides with real geometry, a flashlight casts approximate shadows, an enemy AI chases you along the actual terrain, fog/DOF integrate with splats — chunk streaming holds 60 fps.
+一段真实扫描街角的第一人称微型关卡:玩家与真实几何碰撞不穿墙、手电筒扫过出现近似影子、敌人 AI 沿真实地形追击、雾效/景深与 splat 融合、分块流送保持 60fps。
 
-## Roadmap
+## 路线图
 
-| Milestone | Weeks | Deliverable |
+| 里程碑 | 周期 | 交付物 |
 |---|---|---|
-| M0 — Base | W1–2 | UnityGaussianSplatting integration, baseline scene, metrics |
-| M1 — Proxy colliders | W3–4 | Voxel / flood-fill / SDF / mesh extraction pipeline (core module #1) |
-| M2 — NavMesh + AI | W5–6 | Playable AI-chase prototype |
-| M3 — Approximate lighting | W7–8 | Proxy-depth shadow modulation (core module #2) |
-| M4 — Streaming + ship | W9–10 | Occlusion culling, perf panel, demo video, tech blog |
+| M0 — 基座 | W1–2 | 集成 UnityGaussianSplatting、基线场景、性能数据 |
+| M1 — 碰撞代理 | W3–4 | 体素化/洪泛填充/SDF/网格提取管线(核心模块一) |
+| M2 — NavMesh + AI | W5–6 | 可玩的 AI 追击原型 |
+| M3 — 近似动态光照 | W7–8 | 基于代理深度的阴影调制(核心模块二) |
+| M4 — 流送 + 收尾 | W9–10 | 遮挡剔除、性能面板、Demo 视频、技术博客 |
 
-Details in [ROADMAP.md](ROADMAP.md).
+详见 [ROADMAP.md](ROADMAP.md);执行级技术规格见 [docs/项目书.md](docs/项目书.md)。
 
-## Built on
+## 站在这些肩膀上
 
-- [aras-p/UnityGaussianSplatting](https://github.com/aras-p/UnityGaussianSplatting) (MIT) — the de facto Unity 3DGS renderer; planned integration base.
-- Related research: PhysGaussian, GaMeS, RigGS, Habitat-GS, Mip-Splatting.
+- [aras-p/UnityGaussianSplatting](https://github.com/aras-p/UnityGaussianSplatting)(MIT)——事实上的 Unity 3DGS 渲染器,本项目集成基座
+- 相关研究:PhysGaussian、GaMeS、RigGS、Habitat-GS、Mip-Splatting
 
-## License
+## 许可
 
-Code in this repo: MIT. Note on splat **data**: training with the original INRIA implementation requires an INRIA license for commercial use — prefer gsplat / nerfstudio-based training for shipped scenes.
-
----
-
-## 中文说明
-
-**Splat2Play(实境入戏)** 解决一个问题:3DGS 扫描能以小时级成本得到照片级真实场景,但放进引擎后它只是"一张能移动的照片"——没有碰撞、不能寻路、不响应光照。
-
-本项目构建一套 Unity 工具链,为扫描场景补齐游戏引擎要求的接入层:
-
-- **碰撞代理生成**:splat 密度场体素化 → 洪泛填充 → SDF → 抽稀碰撞网格 → Unity Collider
-- **NavMesh 桥接**:代理网格直出 NavMesh,敌人 AI 可在扫描街道上寻路
-- **近似动态光照**:depth-only 代理 pass 让 splat 近似接收场景阴影与动态光源,无需重训练
-- **分块流送与剔除**:chunk 渲染 + 基于代理的遮挡剔除 + 运行时内存面板
-
-目标 demo:一段真实扫描街角的第一人称小关卡——玩家不穿墙、手电筒有近似影子、AI 沿真实地形追人、雾效融合、流送保 60fps。
-
-路线图与里程碑详情见 [ROADMAP.md](ROADMAP.md)。
+本仓库代码:MIT。关于 splat **数据**的注意:使用 INRIA 官方实现训练的数据,商业使用需要 INRIA 授权——正式交付的场景请用 gsplat / nerfstudio 系训练。
