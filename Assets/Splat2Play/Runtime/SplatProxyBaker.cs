@@ -64,13 +64,31 @@ namespace Splat2Play.Runtime
 
             try
             {
+                // 排除区/封闭区 → Burst 结构
+                using var exclusions = ToAabbs(settings.ExclusionVolumes);
+                using var seals = ToAabbs(settings.SealVolumes);
+
                 // —— 2. 包围盒与网格 ——
                 using (var positions = splats.ToPositions())
+                using (var mmResult = new NativeArray<float3>(2, Allocator.TempJob, NativeArrayOptions.UninitializedMemory))
                 {
-                    var mm = new MinMaxJob { Positions = positions };
-                    mm.Schedule().Complete();
-                    float3 mn = mm.Min, mx = mm.Max;
+                    // 百分位包围盒:逐轴取 [p, 100-p] 分位,剔除天空等远距离离群 splat
+                    float p = Mathf.Clamp(settings.BoundsPercentile, 0f, 10f);
+                    float3 mn, mx;
+                    if (p > 0.01f)
+                    {
+                        ComputePercentileBounds(positions, p, out mn, out mx);
+                        if (math.any(mx - mn < 1e-3f)) { mn = float3.zero; mx = float3.zero; } // 退化保护
+                    }
+                    else
+                    {
+                        var mm = new MinMaxJob { Positions = positions, Exclusions = exclusions, Result = mmResult };
+                        mm.Schedule().Complete();
+                        mn = mmResult[0]; mx = mmResult[1];
+                    }
+
                     float margin = 0.5f;
+                    float3 pctMin = mn, pctMax = mx; // 百分位盒(不含 margin),供取景/玩法使用
                     mn -= margin; mx += margin;
                     float3 size = mx - mn;
                     float maxAxis = math.max(size.x, math.max(size.y, size.z));
@@ -83,10 +101,6 @@ namespace Splat2Play.Runtime
                     };
                     Progress($"体素网格 {res}³(步长 {grid.Step:F3}m, 场景 {maxAxis:F1}m)", 0.12f);
 
-                    // 排除区/封闭区 → Burst 结构
-                    using var exclusions = ToAabbs(settings.ExclusionVolumes);
-                    using var seals = ToAabbs(settings.SealVolumes);
-
                 // —— 3. 体素化 ——
                 var density = new NativeArray<int>(grid.Count, Allocator.Persistent, NativeArrayOptions.ClearMemory);
                 try
@@ -97,14 +111,27 @@ namespace Splat2Play.Runtime
                         OpacityWeight = settings.OpacityWeight, DensityQ16 = density
                     }.Schedule(splats.Length, 256).Complete();
                     Progress("体素化完成", 0.55f);
+                    using (var hres = new NativeArray<ulong>(1, Allocator.TempJob, NativeArrayOptions.ClearMemory))
+                    {
+                        new HashJob { Data = density, Result = hres }.Schedule().Complete();
+                        log.AppendLine($"[诊断] 体素化后密度哈希 {hres[0]:X}");
+                    }
 
                     // —— 4. 填充 ——
-                    new FillJob
+                    using (var stats = new NativeArray<long>(2, Allocator.TempJob, NativeArrayOptions.ClearMemory))
                     {
-                        Grid = grid, ThresholdQ16 = (int)(settings.DensityThreshold * 65536f),
-                        SealVolumes = seals, DensityQ16 = density
-                    }.Schedule().Complete();
-                    Progress("洪泛填充完成", 0.65f);
+                        new FillJob
+                        {
+                            Grid = grid, ThresholdQ16 = (int)(settings.DensityThreshold * 65536f),
+                            SealVolumes = seals, DensityQ16 = density, Stats = stats
+                        }.Schedule().Complete();
+                        Progress($"洪泛填充完成(密度和 {stats[0]}, 实心体素 {stats[1]})", 0.65f);
+                        using (var hres2 = new NativeArray<ulong>(1, Allocator.TempJob, NativeArrayOptions.ClearMemory))
+                        {
+                            new HashJob { Data = density, Result = hres2 }.Schedule().Complete();
+                            log.AppendLine($"[诊断] 填充后密度哈希 {hres2[0]:X}");
+                        }
+                    }
 
                     // —— 5. Surface Nets ——
                     var vertices = new NativeList<float3>(1 << 18, Allocator.Persistent);
@@ -116,20 +143,47 @@ namespace Splat2Play.Runtime
                             Grid = grid, Threshold = settings.DensityThreshold,
                             DensityQ16 = density, Vertices = vertices, Triangles = triangles
                         }.Schedule().Complete();
-                        Progress($"网格提取完成({vertices.Length:N0} 顶点 / {triangles.Count / 3:N0} 三角形)", 0.8f);
+                        Progress($"[SURF] n={vertices.Length} v0={vertices[0]} gridMin={grid.Min} step={grid.Step}", 0.8f);
+                        {
+                            int bad = 0; float maxAbs = 0f;
+                            for (int i = 0; i < vertices.Length; ++i)
+                            {
+                                float3 pv = vertices[i];
+                                if (!math.all(math.isfinite(pv))) ++bad;
+                                else maxAbs = math.max(maxAbs, math.cmax(math.abs(pv)));
+                            }
+                            log.AppendLine($"[诊断] SURF 输出: 非有限={bad} 最大坐标={maxAbs:F1}");
+                        }
 
                         // —— 6. 抽稀 ——
                         int decimPasses = 0;
-                        while (triangles.Count / 3 > settings.MaxTriangles && decimPasses < 6)
+                        var diag = new NativeArray<long>(13, Allocator.TempJob, NativeArrayOptions.ClearMemory);
+                        try
                         {
-                            float step = grid.Step * Mathf.Pow(2f, decimPasses + 1);
-                            new DecimateJob
+                            while (triangles.Count / 3 > settings.MaxTriangles && decimPasses < 6)
                             {
-                                ClusterStep = step, GridMin = grid.Min,
-                                Vertices = vertices, Triangles = triangles
-                            }.Schedule().Complete();
-                            ++decimPasses;
-                            Progress($"抽稀第 {decimPasses} 轮(step={step:F2}m):{vertices.Length:N0} 顶点 / {triangles.Count / 3:N0} 三角形", 0.8f + 0.05f * decimPasses);
+                                float step = grid.Step * Mathf.Pow(2f, decimPasses + 1);
+                                diag[0] = 0; diag[1] = 0; diag[2] = 0; diag[3] = 0;
+                                new DecimateJob
+                                {
+                                    ClusterStep = step, GridMin = grid.Min,
+                                    BoundMin = grid.Min - grid.Step,
+                                    BoundMax = grid.Min + (grid.N + 1) * grid.Step,
+                                    Vertices = vertices, Triangles = triangles, Diag = diag
+                                }.Schedule().Complete();
+                                ++decimPasses;
+                                Progress($"抽稀第 {decimPasses} 轮(step={step:F2}m):{vertices.Length:N0} 顶点 / {triangles.Count / 3:N0} 三角形 | total={diag[0]} clusters={diag[1]} kd=({diag[4]},{diag[5]},{diag[6]}) kMin=({diag[7]},{diag[8]},{diag[9]}) kMax=({diag[10]},{diag[11]},{diag[12]}) 非有限={diag[2]} 早退={diag[3]}", 0.8f + 0.05f * decimPasses);
+                                {
+                                    int bad2 = 0;
+                                    for (int i = 0; i < vertices.Length; ++i)
+                                        if (!math.all(math.isfinite(vertices[i]))) ++bad2;
+                                    log.AppendLine($"[诊断] 抽稀{decimPasses} 后顶点非有限数={bad2}");
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            diag.Dispose();
                         }
                         if (triangles.Count / 3 > settings.MaxTriangles)
                             log.AppendLine($"[警告] 面数 {triangles.Count / 3:N0} 仍高于目标 {settings.MaxTriangles:N0}(已达抽稀上限)");
@@ -141,7 +195,7 @@ namespace Splat2Play.Runtime
                         return new ProxyBakeResult
                         {
                             Mesh = mesh,
-                            SceneBounds = new Bounds((mn + mx) * 0.5f, size),
+                            SceneBounds = new Bounds((pctMin + pctMax) * 0.5f, pctMax - pctMin), // 百分位盒:有意义的玩法范围
                             SplatCount = header.SplatCount,
                             TriangleCount = triangles.Count / 3,
                             VoxelResolution = res,
@@ -167,8 +221,32 @@ namespace Splat2Play.Runtime
             }
         }
 
-        static NativeArray<float3> ToPositions(this NativeArray<SplatRaw> splats)
+        /// <summary>百分位包围盒:逐轴取 [p, 100-p] 分位(采样后排序,确定性)。</summary>
+        static void ComputePercentileBounds(NativeArray<float3> positions, float percentile, out float3 mn, out float3 mx)
         {
+            int sampleCount = math.min(positions.Length, 8192);
+            int stride = math.max(1, positions.Length / sampleCount);
+            var xs = new System.Collections.Generic.List<float>(sampleCount);
+            var ys = new System.Collections.Generic.List<float>(sampleCount);
+            var zs = new System.Collections.Generic.List<float>(sampleCount);
+            for (int i = 0; i < positions.Length; i += stride)
+            {
+                float3 p = positions[i];
+                xs.Add(p.x); ys.Add(p.y); zs.Add(p.z);
+            }
+            float lo = percentile, hi = 100f - percentile;
+            mn = new float3(Pct(xs, lo), Pct(ys, lo), Pct(zs, lo));
+            mx = new float3(Pct(xs, hi), Pct(ys, hi), Pct(zs, hi));
+        }
+
+        static float Pct(System.Collections.Generic.List<float> v, float p)
+        {
+            v.Sort();
+            int idx = Mathf.Clamp((int)(v.Count * p / 100f), 0, v.Count - 1);
+            return v[idx];
+        }
+
+        static NativeArray<float3> ToPositions(this NativeArray<SplatRaw> splats)        {
             var positions = new NativeArray<float3>(splats.Length, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
             for (int i = 0; i < splats.Length; ++i)
                 positions[i] = splats[i].Position;
@@ -190,20 +268,32 @@ namespace Splat2Play.Runtime
 
         static Mesh BuildMesh(NativeList<float3> vertices, NativeList<int> triangles, VoxelGridInfo grid, System.Text.StringBuilder log)
         {
-            var mesh = new Mesh { name = "S2P_ProxyCollision" };
-            int vCount = vertices.Length;
-            var v = new Vector3[vCount];
-            for (int i = 0; i < vCount; ++i)
+            // 最后一道防线(托管侧):丢弃非有限/超界顶点并重映射索引,保证碰撞网格永远有效
+            var cleanV = new System.Collections.Generic.List<Vector3>((int)vertices.Length);
+            var remap = new System.Collections.Generic.Dictionary<int, int>((int)vertices.Length);
+            for (int i = 0; i < vertices.Length; ++i)
             {
                 float3 p = vertices[i];
-                v[i] = new Vector3(p.x, p.y, p.z);
+                if (!math.all(math.isfinite(p)) || math.cmax(math.abs(p)) > 1e5f) continue;
+                remap[i] = cleanV.Count;
+                cleanV.Add(new Vector3(p.x, p.y, p.z));
             }
-            var t = new int[triangles.Length];
-            for (int i = 0; i < triangles.Length; ++i) t[i] = triangles[i];
-            mesh.vertices = v;
-            mesh.SetIndices(t, MeshTopology.Triangles, 0, false);
+            var cleanT = new System.Collections.Generic.List<int>(triangles.Count);
+            int droppedTris = 0;
+            for (int t = 0; t + 2 < triangles.Count; t += 3)
+            {
+                bool ok = true;
+                for (int k = 0; k < 3; ++k)
+                    if (!remap.ContainsKey(triangles[t + k])) { ok = false; break; }
+                if (!ok) { ++droppedTris; continue; }
+                for (int k = 0; k < 3; ++k) cleanT.Add(remap[triangles[t + k]]);
+            }
+
+            var mesh = new Mesh { name = "S2P_ProxyCollision" };
+            mesh.vertices = cleanV.ToArray();
+            mesh.SetIndices(cleanT.ToArray(), MeshTopology.Triangles, 0, false);
             mesh.RecalculateBounds();
-            log.AppendLine($"Mesh: {vCount:N0} 顶点 / {triangles.Count / 3:N0} 三角形");
+            log.AppendLine($"Mesh: {cleanV.Count:N0} 顶点 / {cleanT.Count / 3:N0} 三角形(原始 {vertices.Length:N0}/{triangles.Count / 3:N0},丢弃脏顶点 {vertices.Length - cleanV.Count:N0}、脏三角形 {droppedTris:N0}) | bounds={mesh.bounds.size:F2} center={mesh.bounds.center:F2}");
             return mesh;
         }
 

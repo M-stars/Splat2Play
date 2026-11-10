@@ -18,6 +18,8 @@ namespace Splat2Play.Runtime
         [Range(0.05f, 1f)] public float DensityThreshold = 0.5f;
         [Tooltip("烘焙时按 splat 不透明度缩放其贡献(过滤半透明漂浮物)。")]
         public float OpacityWeight = 1.0f;
+        [Tooltip("包围盒百分位(0–10):逐轴取 [p,100-p] 分位,剔除天空等远距离离群 splat。0 = 用绝对 min/max。")]
+        [Range(0f, 10f)] public float BoundsPercentile = 1f;
 
         [Header("填充与封闭")]
         [Tooltip("洪泛填充封闭内部(把扫描漏洞里的空腔标记为实心)。")]

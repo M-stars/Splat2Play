@@ -35,23 +35,60 @@ namespace Splat2Play.Runtime
         public bool Contains(float3 p) => math.all(p >= Min & p <= Max);
     }
 
-    /// <summary>计算 splat 位置包围盒(单线程线性,Burst 下毫秒级)。</summary>
+
+    /// <summary>诊断用:FNV-1a 哈希(抓"和相同但置换"的非确定性)。</summary>
+    [BurstCompile(FloatMode = FloatMode.Fast)]
+    public struct HashJob : IJob
+    {
+        [ReadOnly] public NativeArray<int> Data;
+        public NativeArray<ulong> Result; // [0]=hash
+
+        public void Execute()
+        {
+            ulong h = 14695981039346656037UL;
+            for (int i = 0; i < Data.Length; ++i)
+            {
+                uint v = (uint)Data[i];
+                for (int b = 0; b < 4; ++b)
+                {
+                    h ^= (v >> (b * 8)) & 0xFFUL;
+                    h *= 1099511628211UL;
+                }
+            }
+            Result[0] = h;
+        }
+    }
+
+    /// <summary>计算 splat 位置包围盒。注意:IJob.Schedule 会拷贝结构体,
+    /// 输出必须落在 NativeArray(NativeContainer)里才能带回来。</summary>
     [BurstCompile(FloatMode = FloatMode.Fast)]
     public struct MinMaxJob : IJob
     {
         [ReadOnly] public NativeArray<float3> Positions;
-        public float3 Min, Max;
+        [ReadOnly] public NativeArray<AabbRange> Exclusions;
+        public NativeArray<float3> Result; // [0]=min [1]=max(仅统计不在排除区内的 splat)
 
         public void Execute()
         {
             float3 mn = new(float.PositiveInfinity), mx = new(float.NegativeInfinity);
+            bool any = false;
             for (int i = 0; i < Positions.Length; ++i)
             {
                 float3 p = Positions[i];
+                if (Exclusions.Length > 0)
+                {
+                    bool excluded = false;
+                    for (int e = 0; e < Exclusions.Length; ++e)
+                        if (Exclusions[e].Contains(p)) { excluded = true; break; }
+                    if (excluded) continue;
+                }
                 mn = math.min(mn, p);
                 mx = math.max(mx, p);
+                any = true;
             }
-            Min = mn; Max = mx;
+            if (!any) { mn = float3.zero; mx = float3.zero; }
+            Result[0] = mn;
+            Result[1] = mx;
         }
     }
 
@@ -87,6 +124,8 @@ namespace Splat2Play.Runtime
 
             float3 lo = (s.Position - half - Grid.Min) / Grid.Step;
             float3 hi = (s.Position + half - Grid.Min) / Grid.Step;
+            // 整个 3σ AABB 在网格外(如天空离群点)→ 跳过,避免钳位后堆积到边角体素
+            if (math.any(lo > new float3(Grid.N - 1)) || math.any(hi < float3.zero)) return;
             int3 iLo = math.clamp((int3)math.floor(lo), 0, Grid.N - 1);
             int3 iHi = math.clamp((int3)math.floor(hi), 0, Grid.N - 1);
 
@@ -111,6 +150,7 @@ namespace Splat2Play.Runtime
             }
         }
 
+
         static float3x3 QuaternionToMatrix(float4 q)
         {
             // xyzw 四元数 → 行主序旋转矩阵
@@ -134,6 +174,7 @@ namespace Splat2Play.Runtime
         public int ThresholdQ16;
         [ReadOnly] public NativeArray<AabbRange> SealVolumes;
         public NativeArray<int> DensityQ16; // 最高位复用为 outside 标记(输出保留该位)
+        public NativeArray<long> Stats;     // [0]=密度和 [1]=实心体素数(诊断用,NativeContainer 才能跨 Schedule 带回)
 
         const int kOutsideBit = unchecked((int)0x80000000);
 
@@ -190,13 +231,18 @@ namespace Splat2Play.Runtime
                     if (z < n - 1) TrySeed(DensityQ16, queue, idx + n * n, ThresholdQ16);
                 }
 
-                // 封闭腔体 → 置实心(把密度补到 1.0)
+                // 封闭腔体 → 置实心(把密度补到 1.0);顺带统计校验和
+                long sum = 0, solid = 0;
                 for (int i = 0; i < count; ++i)
                 {
                     int v = DensityQ16[i];
                     if ((v & kOutsideBit) == 0 && (v & 0x7FFFFFFF) < ThresholdQ16)
                         DensityQ16[i] = 65536;
+                    int d = DensityQ16[i] & 0x7FFFFFFF;
+                    sum += d;
+                    if (d >= ThresholdQ16) ++solid;
                 }
+                if (Stats.IsCreated) { Stats[0] = sum; Stats[1] = solid; }
             }
             finally
             {
@@ -311,88 +357,167 @@ namespace Splat2Play.Runtime
         {
             if ((a >= thr) != (b >= thr))
             {
-                float t = (thr - a) / (b - a);
+                // t 钳位到 [0,1]:a/b 贴着阈值时 b-a 可能趋零,未钳位的 t 会爆到天文字坐标
+                float t = math.clamp((thr - a) / (b - a), 0f, 1f);
                 sum += pa + (pb - pa) * t;
                 ++crossings;
             }
         }
     }
 
-    /// <summary>T1.5 顶点聚类抽稀:量化顶点到聚类网格,簇内取均值,重排索引。可反复加倍 step 直到面数达标。</summary>
+    /// <summary>
+    /// T1.5 顶点聚类抽稀:量化顶点到聚类网格,桶数组直接寻址(无哈希表,构造性确定),
+    /// 簇内取均值,剔除退化三角形。可反复加倍 step 直到面数达标。
+    /// </summary>
     [BurstCompile(FloatMode = FloatMode.Fast)]
     public struct DecimateJob : IJob
     {
         public float ClusterStep;          // 世界尺寸
         public float3 GridMin;             // 量化基准(保证确定性)
+        public float3 BoundMin, BoundMax;  // 顶点理论范围(体素网格外扩一格)
         public NativeList<float3> Vertices;
         public NativeList<int> Triangles;
+        public NativeArray<long> Diag;     // [0]=total [1]=clusterCount [2]=非有限顶点数 [3]=是否早退
 
         public void Execute()
         {
             int oldCount = Vertices.Length;
-            var keyToNew = new NativeParallelHashMap<int3, int>(1 << 18, Allocator.Temp);
+            if (oldCount == 0) return;
+            int nonFinite = 0;
+            for (int i = 0; i < oldCount; ++i)
+                if (!math.all(math.isfinite(Vertices[i]))) ++nonFinite;
+
+            // 键空间:量化网格范围
+            int3 kMin = new(int.MaxValue), kMax = new(int.MinValue);
+            var keys = new NativeArray<int3>(oldCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
             try
             {
-                // Pass 1: 建簇表(key→新顶点索引,按首遇顺序,确定性)
+                // 饱和钳位:有限但巨大的坐标(上游数值异常)会把 int3 键打满,使 kMax-kMin 溢出
                 for (int i = 0; i < oldCount; ++i)
                 {
-                    int3 key = (int3)math.floor((Vertices[i] - GridMin) / ClusterStep);
-                    if (!keyToNew.ContainsKey(key))
-                        keyToNew.Add(key, keyToNew.Count());
+                    float3 f = (Vertices[i] - GridMin) / ClusterStep;
+                    f = math.clamp(f, -1e6f, 1e6f);
+                    int3 k = (int3)math.floor(f);
+                    keys[i] = k;
                 }
-                int clusterCount = keyToNew.Count();
+                // 键范围 = 体素网格的理论键范围(顶点是体素中心插值,必然落在网格内;
+                // 用常数硬钳位,不依赖任何数据采样 —— 构造性确定且抗上游数值异常)
+                {
+                    float3 kLoF = (BoundMin - GridMin) / ClusterStep;
+                    float3 kHiF = (BoundMax - GridMin) / ClusterStep;
+                    kMin = (int3)math.floor(math.clamp(kLoF, -1000f, 1000f));
+                    kMax = (int3)math.floor(math.clamp(kHiF, -1000f, 1000f));
+                }
+                for (int i = 0; i < oldCount; ++i)
+                    keys[i] = math.clamp(keys[i], kMin, kMax);
+                int3 kd = kMax - kMin + 1;
+                long total = (long)kd.x * kd.y * kd.z;
+                if (Diag.IsCreated)
+                {
+                    Diag[0] = total; Diag[2] = nonFinite;
+                    Diag[4] = kd.x; Diag[5] = kd.y; Diag[6] = kd.z;
+                    Diag[7] = kMin.x; Diag[8] = kMin.y; Diag[9] = kMin.z;
+                    Diag[10] = kMax.x; Diag[11] = kMax.y; Diag[12] = kMax.z;
+                }
+                if (total > 1 << 26) // 6700 万桶上限,超出说明聚类粒度异常
+                {
+                    if (Diag.IsCreated) Diag[3] = 1;
+                    return; // 跳过本次抽稀(保守:保留上一轮结果)
+                }
 
-                var clusterSum = new NativeArray<float3>(math.max(1, clusterCount), Allocator.Temp, NativeArrayOptions.UninitializedMemory);
-                var clusterCounts = new NativeArray<int>(math.max(1, clusterCount), Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+                int bucketCount = (int)total;
+                var bucketIndex = new NativeArray<int>(bucketCount, Allocator.Temp, NativeArrayOptions.ClearMemory); // -1 表示空,ClearMemory 用 int0 → 用哨兵
+                for (int i = 0; i < bucketCount; ++i) bucketIndex[i] = -1;
+                var bucketSum = new NativeArray<float3>(bucketCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+                var bucketCountArr = new NativeArray<int>(bucketCount, Allocator.Temp, NativeArrayOptions.ClearMemory);
                 try
                 {
-                    // 求和与遍历顺序无关(浮点加法非交换,但这里固定遍历顺序 → 确定性)
-                    for (int i = 0; i < oldCount; ++i)
-                    {
-                        float3 p = Vertices[i];
-                        int3 key = (int3)math.floor((p - GridMin) / ClusterStep);
-                        int ci = keyToNew[key];
-                        clusterSum[ci] += p;
-                        clusterCounts[ci]++;
-                    }
-
-                    var newVerts = new NativeList<float3>(clusterCount, Allocator.Temp);
-                    var newTris = new NativeList<int>(Triangles.Length, Allocator.Temp);
+                    int clusterCount = 0;
+                    var oldToNew = new NativeArray<int>(oldCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
                     try
                     {
-                        for (int c = 0; c < clusterCount; ++c)
-                            newVerts.Add(clusterSum[c] / math.max(1, clusterCounts[c]));
-                        // 重排并剔除退化三角形(聚类合并顶点后必然出现 a==b / b==c 类退化)
-                        for (int t = 0; t + 2 < Triangles.Length; t += 3)
+                        // 构造性防御:非有限/超界顶点直接丢弃(-1),保证输出网格永远干净
+                        for (int i = 0; i < oldCount; ++i)
                         {
-                            int i0 = keyToNew[(int3)math.floor((Vertices[Triangles[t]] - GridMin) / ClusterStep)];
-                            int i1 = keyToNew[(int3)math.floor((Vertices[Triangles[t + 1]] - GridMin) / ClusterStep)];
-                            int i2 = keyToNew[(int3)math.floor((Vertices[Triangles[t + 2]] - GridMin) / ClusterStep)];
-                            if (i0 == i1 || i1 == i2 || i0 == i2) continue;
-                            newTris.Add(i0); newTris.Add(i1); newTris.Add(i2);
+                            float3 p = Vertices[i];
+                            if (!math.all(math.isfinite(p)) || math.any(math.abs(p) > 1e4f))
+                            {
+                                oldToNew[i] = -1;
+                                continue;
+                            }
+                            int3 k = keys[i] - kMin;
+                            int bi = k.x + k.y * kd.x + k.z * kd.x * kd.y;
+                            int ci = bucketIndex[bi];
+                            if (ci < 0)
+                            {   // 首触:bucketSum 是 UninitializedMemory,直接赋值而非 +=(否则读到脏内存 → NaN)
+                                bucketIndex[bi] = ci = clusterCount++;
+                                bucketSum[ci] = p;
+                                bucketCountArr[ci] = 1;
+                                oldToNew[i] = ci;
+                            }
+                            else
+                            {
+                                oldToNew[i] = ci;
+                                bucketSum[ci] += p;
+                                bucketCountArr[ci]++;
+                            }
                         }
 
-                        Vertices.Clear();
-                        for (int i = 0; i < newVerts.Length; ++i) Vertices.Add(newVerts[i]);
-                        Triangles.Clear();
-                        for (int i = 0; i < newTris.Length; ++i) Triangles.Add(newTris[i]);
+                        if (Diag.IsCreated) Diag[1] = clusterCount;
+                        var newVerts = new NativeList<float3>(clusterCount, Allocator.Temp);
+                        var newTris = new NativeList<int>(Triangles.Length, Allocator.Temp);
+                        try
+                        {
+                            for (int c = 0; c < clusterCount; ++c)
+                                newVerts.Add(bucketSum[c] / math.max(1, bucketCountArr[c]));
+                            for (int t = 0; t + 2 < Triangles.Length; t += 3)
+                            {
+                                int i0 = oldToNew[Triangles[t]];
+                                int i1 = oldToNew[Triangles[t + 1]];
+                                int i2 = oldToNew[Triangles[t + 2]];
+                                if (i0 < 0 || i1 < 0 || i2 < 0) continue; // 引用了被丢弃的脏顶点
+                                if (i0 == i1 || i1 == i2 || i0 == i2) continue; // 聚类合并产生的退化三角形
+                                newTris.Add(i0); newTris.Add(i1); newTris.Add(i2);
+                            }
+
+                            Vertices.Clear();
+                            for (int i = 0; i < newVerts.Length; ++i) Vertices.Add(newVerts[i]);
+                            Triangles.Clear();
+                            for (int i = 0; i < newTris.Length; ++i) Triangles.Add(newTris[i]);
+                        }
+                        finally
+                        {
+                            if (newVerts.IsCreated) newVerts.Dispose();
+                            if (newTris.IsCreated) newTris.Dispose();
+                        }
                     }
                     finally
                     {
-                        if (newVerts.IsCreated) newVerts.Dispose();
-                        if (newTris.IsCreated) newTris.Dispose();
+                        if (oldToNew.IsCreated) oldToNew.Dispose();
                     }
                 }
                 finally
                 {
-                    if (clusterSum.IsCreated) clusterSum.Dispose();
-                    if (clusterCounts.IsCreated) clusterCounts.Dispose();
+                    if (bucketIndex.IsCreated) bucketIndex.Dispose();
+                    if (bucketSum.IsCreated) bucketSum.Dispose();
+                    if (bucketCountArr.IsCreated) bucketCountArr.Dispose();
                 }
             }
             finally
             {
-                if (keyToNew.IsCreated) keyToNew.Dispose();
+                if (keys.IsCreated) keys.Dispose();
             }
         }
+        static void SortInts(NativeArray<int> a, int n)
+        {
+            for (int i = 1; i < n; ++i)
+            {
+                int v = a[i];
+                int j = i - 1;
+                while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; --j; }
+                a[j + 1] = v;
+            }
+        }
+
     }
 }
