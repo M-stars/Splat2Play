@@ -7,7 +7,9 @@
         "Unity.Collections",
         "Unity.Mathematics",
         "Unity.AI.Navigation",
-        "Unity.InputSystem"
+        "Unity.InputSystem",
+        "Unity.RenderPipelines.Universal.Runtime",
+        "Unity.RenderPipelines.Core.Runtime"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -16,6 +18,12 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.render-pipelines.universal",
+            "expression": "",
+            "define": "S2P_ENABLE_URP"
+        }
+    ],
     "noEngineReferences": false
 }

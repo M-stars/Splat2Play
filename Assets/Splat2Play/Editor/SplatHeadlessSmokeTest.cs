@@ -59,17 +59,7 @@ namespace Splat2Play.Editor
                 // 3. 等待异步加载(batch 下编辑器 tick 不泵 → 反射直接驱动 UpdateLoading 状态机)
                 var sw = Stopwatch.StartNew();
                 renderer.Reload();
-                var updateLoading = typeof(GaussianSplatRenderer).GetMethod("UpdateLoading",
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                if (updateLoading == null) throw new Exception("反射未找到 UpdateLoading");
-                int waitMs = 0;
-                while (renderer.isLoading && waitMs < 180_000)
-                {
-                    updateLoading.Invoke(renderer, null);
-                    if (renderer.loadError != null) break;
-                    System.Threading.Thread.Sleep(20);
-                    waitMs += 20;
-                }
+                WaitForSplatLoad(renderer);
                 if (renderer.loadError != null)
                     throw new Exception($"splat 加载失败:{renderer.loadError}");
                 if (renderer.splatCount == 0)
@@ -143,6 +133,7 @@ namespace Splat2Play.Editor
                     navOk = triChildren > 0 || triAll > 0;
                     log.AppendLine($"NavMesh: Children={triChildren} All={triAll}, ok={navOk}, colliderBounds={go.GetComponentInChildren<MeshCollider>().bounds.size:F2}");
 
+
                     // 相机移到百分位盒内近景(室内场景应有可辨识画面)
                     var sb = proxy.SceneBounds;
                     camGo.transform.position = sb.center + new Vector3(0f, Mathf.Min(1.6f, sb.size.y * 0.35f), -sb.size.magnitude * 0.4f);
@@ -155,6 +146,7 @@ namespace Splat2Play.Editor
                     renderer.enabled = false;
                     float nb2 = CapturePng(cam, Path.Combine(OutDir, "render_collision.png"));
                     renderer.enabled = true;
+                    WaitForSplatLoad(renderer); // 重载是异步的,必须泵完才能继续截图
                     log.AppendLine($"近景(碰撞调试): 非黑像素 {nb2:P1} → render_collision.png");
 
                     // 几何验证(camera.Render() 在 URP 下不画不透明网格 → 用 Raycast 证明碰撞体工作)
@@ -171,6 +163,26 @@ namespace Splat2Play.Editor
                         else log.AppendLine($"[碰撞验证] {d} → 未命中");
                     }
                     log.AppendLine($"[碰撞验证] 命中 {hitCount}/6 方向");
+
+                    // —— M3:注册代理网格 + 手电筒(软阴影)→ fork 合成 shader 调制生效 ——
+                    S2PLightProxyRegistry.RegisterShadowMesh(proxy.CollisionMesh);
+                    var flashlight = camGo.AddComponent<Light>();
+                    flashlight.type = LightType.Spot;
+                    flashlight.range = 25f;
+                    flashlight.spotAngle = 55f;
+                    flashlight.intensity = 60f;
+                    flashlight.shadows = LightShadows.Soft; // URP 附加光阴影图(调制采样用)
+                    var driver = go.AddComponent<S2PLightModulationDriver>();
+                    driver.Flashlight = flashlight;
+                    driver.SetGlobalsNow();
+                    // GS 渲染选项:Stochastic + Reprojected(包默认),splat 深度缓冲才有值
+                    GaussianSplatting.Runtime.GaussianSplatRenderingOptions.instance.m_Transparency =
+                        GaussianSplatting.Runtime.TransparencyMode.Stochastic;
+                    GaussianSplatting.Runtime.GaussianSplatRenderingOptions.instance.m_TemporalFilter =
+                        GaussianSplatting.Runtime.StochasticTemporalFilter.Reprojected;
+                    float nbLight = CapturePng(cam, Path.Combine(OutDir, "render_light_close.png"));
+                    log.AppendLine($"近景(手电筒调制): 非黑像素 {nbLight:P1} → render_light_close.png");
+
                 }
 
                 // 7. 写 benchmark 数据
@@ -221,6 +233,22 @@ namespace Splat2Play.Editor
             float nonBlack = NonBlackRatio(tex);
             UnityEngine.Object.DestroyImmediate(tex);
             return nonBlack;
+        }
+
+        static void WaitForSplatLoad(GaussianSplatRenderer renderer)
+        {
+            var updateLoading = typeof(GaussianSplatRenderer).GetMethod("UpdateLoading",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (updateLoading == null) throw new Exception("反射未找到 UpdateLoading");
+            int waitMs = 0;
+            while (renderer.isLoading && waitMs < 180_000)
+            {
+                updateLoading.Invoke(renderer, null);
+                if (renderer.loadError != null) break;
+                System.Threading.Thread.Sleep(20);
+                waitMs += 20;
+            }
+            if (renderer.loadError != null) throw new Exception($"splat 加载失败:{renderer.loadError}");
         }
 
         static float NonBlackRatio(Texture2D tex)

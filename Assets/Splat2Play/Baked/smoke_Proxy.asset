@@ -1,29 +1,6 @@
 %YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
---- !u!114 &11400000
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 0}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 0}
-  m_Name: smoke_Proxy
-  m_EditorClassIdentifier: Splat2Play.Runtime:Splat2Play.Runtime:ProxyData
-  CollisionMesh: {fileID: 5042033807652628695}
-  SceneBounds:
-    m_Center: {x: -2.1686716, y: 1.640563, z: 2.876058}
-    m_Extent: {x: 15.040967, y: 11.820909, z: 11.832706}
-  SourceSplatCount: 1244819
-  TriangleCount: 61035
-  VoxelResolution: 256
-  DensityThreshold: 0.5
-  Settings: {fileID: 0}
-  PatchBoxes: []
-  BakeLog: "[     0 ms] \u89E3\u6790 PLY \u5934\u90E8\r\n[     1 ms] \u89E3\u6790 PLY \u5934\u90E8\u5B8C\u6210(1,244,819 splats, stride=248B)\r\n[   186 ms] \u8BFB\u53D6\u9876\u70B9\u6570\u636E\u5B8C\u6210(294.4 MB)\r\n[   209 ms] \u4F53\u7D20\u7F51\u683C 256\xB3(\u6B65\u957F 0.121m, \u573A\u666F 31.1m)\r\n[   258 ms] \u4F53\u7D20\u5316\u5B8C\u6210\r\n[\u8BCA\u65AD] \u4F53\u7D20\u5316\u540E\u5BC6\u5EA6\u54C8\u5E0C DFEE89CC6F3C4DA7\r\n[  1294 ms] \u6D2A\u6CDB\u586B\u5145\u5B8C\u6210(\u5BC6\u5EA6\u548C 20043012773, \u5B9E\u5FC3\u4F53\u7D20 186830)\r\n[\u8BCA\u65AD] \u586B\u5145\u540E\u5BC6\u5EA6\u54C8\u5E0C 90FEBC326907A10B\r\n[  1597 ms] [SURF] n=1155536 v0=float3(-8.45993f, 7.854927f, -12.52124f) gridMin=float3(-17.70964f, -13.9004f, -12.66491f) step=0.1214138\r\n[\u8BCA\u65AD] SURF \u8F93\u51FA: \u975E\u6709\u9650=0 \u6700\u5927\u5750\u6807=18.4\r\n[  1704 ms] \u62BD\u7A00\u7B2C 1 \u8F6E(step=0.24m):230,548 \u9876\u70B9 / 875,371 \u4E09\u89D2\u5F62 | total=2197000 clusters=230548 kd=(130,130,130) kMin=(-1,-1,-1) kMax=(128,128,128) \u975E\u6709\u9650=0 \u65E9\u9000=0\r\n[\u8BCA\u65AD] \u62BD\u7A001 \u540E\u9876\u70B9\u975E\u6709\u9650\u6570=0\r\n[  1722 ms] \u62BD\u7A00\u7B2C 2 \u8F6E(step=0.49m):50,117 \u9876\u70B9 / 235,430 \u4E09\u89D2\u5F62 | total=287496 clusters=50117 kd=(66,66,66) kMin=(-1,-1,-1) kMax=(64,64,64) \u975E\u6709\u9650=0 \u65E9\u9000=0\r\n[\u8BCA\u65AD] \u62BD\u7A002 \u540E\u9876\u70B9\u975E\u6709\u9650\u6570=0\r\n[  1726 ms] \u62BD\u7A00\u7B2C 3 \u8F6E(step=0.97m):9,476 \u9876\u70B9 / 61,035 \u4E09\u89D2\u5F62 | total=39304 clusters=9476 kd=(34,34,34) kMin=(-1,-1,-1) kMax=(32,32,32) \u975E\u6709\u9650=0 \u65E9\u9000=0\r\n[\u8BCA\u65AD] \u62BD\u7A003 \u540E\u9876\u70B9\u975E\u6709\u9650\u6570=0\r\nMesh: 9,476 \u9876\u70B9 / 61,035 \u4E09\u89D2\u5F62(\u539F\u59CB 9,476/61,035,\u4E22\u5F03\u810F\u9876\u70B9 0\u3001\u810F\u4E09\u89D2\u5F62 0) | bounds=(30.92, 30.90, 30.87) center=(-2.19, 1.67, 2.89)\r\n[  1751 ms] \u70D8\u7119\u5B8C\u6210\r\n"
---- !u!43 &5042033807652628695
+--- !u!43 &-1759380606065323192
 Mesh:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -202,3 +179,26 @@ Mesh:
       - serializedVersion: 1
         m_IndexStart: 0
         m_IndexCount: 0
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 0}
+  m_Name: smoke_Proxy
+  m_EditorClassIdentifier: Splat2Play.Runtime:Splat2Play.Runtime:ProxyData
+  CollisionMesh: {fileID: -1759380606065323192}
+  SceneBounds:
+    m_Center: {x: -2.1686716, y: 1.640563, z: 2.876058}
+    m_Extent: {x: 15.040967, y: 11.820909, z: 11.832706}
+  SourceSplatCount: 1244819
+  TriangleCount: 61035
+  VoxelResolution: 256
+  DensityThreshold: 0.5
+  Settings: {fileID: 0}
+  PatchBoxes: []
+  BakeLog: "[     0 ms] \u89E3\u6790 PLY \u5934\u90E8\r\n[     1 ms] \u89E3\u6790 PLY \u5934\u90E8\u5B8C\u6210(1,244,819 splats, stride=248B)\r\n[   233 ms] \u8BFB\u53D6\u9876\u70B9\u6570\u636E\u5B8C\u6210(294.4 MB)\r\n[   257 ms] \u4F53\u7D20\u7F51\u683C 256\xB3(\u6B65\u957F 0.121m, \u573A\u666F 31.1m)\r\n[   302 ms] \u4F53\u7D20\u5316\u5B8C\u6210\r\n[\u8BCA\u65AD] \u4F53\u7D20\u5316\u540E\u5BC6\u5EA6\u54C8\u5E0C DFEE89CC6F3C4DA7\r\n[  1455 ms] \u6D2A\u6CDB\u586B\u5145\u5B8C\u6210(\u5BC6\u5EA6\u548C 20043012773, \u5B9E\u5FC3\u4F53\u7D20 186830)\r\n[\u8BCA\u65AD] \u586B\u5145\u540E\u5BC6\u5EA6\u54C8\u5E0C 90FEBC326907A10B\r\n[  1764 ms] [SURF] n=1155536 v0=float3(-8.45993f, 7.854927f, -12.52124f) gridMin=float3(-17.70964f, -13.9004f, -12.66491f) step=0.1214138\r\n[\u8BCA\u65AD] SURF \u8F93\u51FA: \u975E\u6709\u9650=0 \u6700\u5927\u5750\u6807=18.4\r\n[  1871 ms] \u62BD\u7A00\u7B2C 1 \u8F6E(step=0.24m):230,548 \u9876\u70B9 / 875,371 \u4E09\u89D2\u5F62 | total=2197000 clusters=230548 kd=(130,130,130) kMin=(-1,-1,-1) kMax=(128,128,128) \u975E\u6709\u9650=0 \u65E9\u9000=0\r\n[\u8BCA\u65AD] \u62BD\u7A001 \u540E\u9876\u70B9\u975E\u6709\u9650\u6570=0\r\n[  1888 ms] \u62BD\u7A00\u7B2C 2 \u8F6E(step=0.49m):50,117 \u9876\u70B9 / 235,430 \u4E09\u89D2\u5F62 | total=287496 clusters=50117 kd=(66,66,66) kMin=(-1,-1,-1) kMax=(64,64,64) \u975E\u6709\u9650=0 \u65E9\u9000=0\r\n[\u8BCA\u65AD] \u62BD\u7A002 \u540E\u9876\u70B9\u975E\u6709\u9650\u6570=0\r\n[  1892 ms] \u62BD\u7A00\u7B2C 3 \u8F6E(step=0.97m):9,476 \u9876\u70B9 / 61,035 \u4E09\u89D2\u5F62 | total=39304 clusters=9476 kd=(34,34,34) kMin=(-1,-1,-1) kMax=(32,32,32) \u975E\u6709\u9650=0 \u65E9\u9000=0\r\n[\u8BCA\u65AD] \u62BD\u7A003 \u540E\u9876\u70B9\u975E\u6709\u9650\u6570=0\r\nMesh: 9,476 \u9876\u70B9 / 61,035 \u4E09\u89D2\u5F62(\u539F\u59CB 9,476/61,035,\u4E22\u5F03\u810F\u9876\u70B9 0\u3001\u810F\u4E09\u89D2\u5F62 0) | bounds=(30.92, 30.90, 30.87) center=(-2.19, 1.67, 2.89)\r\n[  1912 ms] \u70D8\u7119\u5B8C\u6210\r\n"

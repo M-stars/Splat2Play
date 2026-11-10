@@ -37,15 +37,16 @@ namespace Splat2Play.Editor
                 bool exists = false;
                 foreach (var f in rendererData.rendererFeatures)
                     if (f != null && f.GetType() == featureType) { exists = true; break; }
-                if (exists) continue;
-
-                var feature = (ScriptableRendererFeature)ScriptableObject.CreateInstance(featureType);
-                feature.name = "GaussianSplatURPFeature";
-                AssetDatabase.AddObjectToAsset(feature, rendererData);
-                rendererData.rendererFeatures.Add(feature);
-                EditorUtility.SetDirty(rendererData);
-                ++wired;
-                Debug.Log($"[Splat2Play] 已为 {path} 添加 GaussianSplatURPFeature");
+                if (!exists)
+                {
+                    var feature = (ScriptableRendererFeature)ScriptableObject.CreateInstance(featureType);
+                    feature.name = "GaussianSplatURPFeature";
+                    AssetDatabase.AddObjectToAsset(feature, rendererData);
+                    rendererData.rendererFeatures.Add(feature);
+                    EditorUtility.SetDirty(rendererData);
+                    ++wired;
+                    Debug.Log($"[Splat2Play] 已为 {path} 添加 GaussianSplatURPFeature");
+                }
             }
             AssetDatabase.SaveAssets();
             Debug.Log($"[Splat2Play] URP Renderer Feature 接线完成,新增 {wired} 处");
