@@ -43,10 +43,11 @@ namespace Splat2Play.Runtime
     public static class SplatProxyBaker
     {
         /// <summary>
-        /// 完整烘焙:PLY → 密度场 → 填充 → Surface Nets → 抽稀 → Mesh。
+        /// 完整烘焙:PLY/SPZ → 密度场 → 填充 → Surface Nets → 抽稀 → Mesh。
         /// mesh 只在 result 内有效,调用方负责转存为资产或 Dispose。
+        /// M5:输入流自动按文件头路由 PLY / SPZ;体素化后端按 settings.Backend 选择。
         /// </summary>
-        public static ProxyBakeResult Bake(Stream plyStream, ProxyBakeSettings settings,
+        public static ProxyBakeResult Bake(Stream sourceStream, ProxyBakeSettings settings,
                                            Action<string, float> onProgress = null)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
@@ -58,14 +59,11 @@ namespace Splat2Play.Runtime
                 log.AppendLine($"[{sw.ElapsedMilliseconds,6} ms] {stage}");
             }
 
-            // —— 1. 解析 PLY ——
-            Progress("解析 PLY 头部", 0f);
-            var header = PlySplatReader.ReadHeader(plyStream);
-            if (header.SplatCount == 0) throw new InvalidDataException("PLY 中没有 splat");
-            Progress($"解析 PLY 头部完成({header.SplatCount:N0} splats, stride={header.Stride}B)", 0.05f);
-
-            NativeArray<SplatRaw> splats = PlySplatReader.ReadSplats(plyStream, header, out long vertexBytes);
-            Progress($"读取顶点数据完成({vertexBytes / (1024f * 1024f):F1} MB)", 0.1f);
+            // —— 1. 解析 PLY / SPZ(M5:按魔数自动路由)——
+            Progress("解析扫描资产头部", 0f);
+            var splats = SplatSourceReader.ReadAll(sourceStream, out int splatCount, out SplatSourceKind kind, out long sourceBytes);
+            if (splatCount == 0) throw new InvalidDataException("扫描资产中没有 splat");
+            Progress($"解析 {(kind == SplatSourceKind.Spz ? "SPZ" : "PLY")} 头部完成({splatCount:N0} splats, 属性 {sourceBytes / (1024f * 1024f):F1} MB)", 0.05f);
 
             try
             {
@@ -108,16 +106,39 @@ namespace Splat2Play.Runtime
                     // 提取 M4 空间分块包围盒(4×2×4 子块)
                     BuildSpatialChunks(splats, exclusions, pctMin, pctMax, out var chunkBounds, out var chunkCounts);
 
-                // —— 3. 体素化 ——
+                // —— 3. 体素化(M5:按 Backend 路由 CPU Burst / GPU Compute)——
                 var density = new NativeArray<int>(grid.Count, Allocator.Persistent, NativeArrayOptions.ClearMemory);
                 try
                 {
-                    new VoxelizeJob
+                    // Auto 策略:支持 Compute 且 256³/512³ 且点数 ≥ 100 万时走 GPU(§2.1 T5.2)
+                    bool autoGpu = settings.Backend == ProxyBakeBackend.Auto
+                                   && SystemInfo.supportsComputeShaders
+                                   && res >= 256 && splats.Length >= 1_000_000;
+                    bool useGpu = settings.Backend == ProxyBakeBackend.GPUCompute || autoGpu;
+                    bool gpuSdfDone = false;
+                    if (useGpu && !SystemInfo.supportsComputeShaders)
                     {
-                        Splats = splats, Exclusions = exclusions, Grid = grid,
-                        OpacityWeight = settings.OpacityWeight, DensityQ16 = density
-                    }.Schedule(splats.Length, 256).Complete();
-                    Progress("体素化完成", 0.55f);
+                        log.AppendLine("[警告] GPUCompute 后端不可用(不支持 Compute Shader),回退 CPU 确定性管线");
+                        useGpu = false;
+                    }
+                    if (useGpu)
+                    {
+                        var gpuSw = Stopwatch.StartNew();
+                        bool sdfOnGpu = settings.UseSDF && res < 512; // 512³ 自动关 SDF 的规则与 CPU 一致
+                        S2PGpuVoxelBaker.Voxelize(splats, exclusions, grid, settings.OpacityWeight, density, sdfOnGpu);
+                        gpuSdfDone = sdfOnGpu;
+                        log.AppendLine($"[M5] GPU Compute 体素化{(sdfOnGpu ? " + SDF 平滑" : "")} 耗时 {gpuSw.ElapsedMilliseconds} ms(含读回)");
+                        Progress("GPU 体素化完成", 0.55f);
+                    }
+                    else
+                    {
+                        new VoxelizeJob
+                        {
+                            Splats = splats, Exclusions = exclusions, Grid = grid,
+                            OpacityWeight = settings.OpacityWeight, DensityQ16 = density
+                        }.Schedule(splats.Length, 256).Complete();
+                        Progress("体素化完成", 0.55f);
+                    }
                     using (var hres = new NativeArray<ulong>(1, Allocator.TempJob, NativeArrayOptions.ClearMemory))
                     {
                         new HashJob { Data = density, Result = hres }.Schedule().Complete();
@@ -142,9 +163,12 @@ namespace Splat2Play.Runtime
                     }
 
                     // —— 4.5 可选 SDF 平滑(§5.1 useSDF,512 档自动跳过以保证内存峰值 <2GB) ——
-                    bool applySdf = settings.UseSDF && res < 512;
+                    // M5:GPU 后端已在读回前于 GPU 上完成平滑(规格 §2.2 流程图:体素化→SDF→读回→填充)
+                    bool applySdf = settings.UseSDF && res < 512 && !gpuSdfDone;
                     if (settings.UseSDF && res >= 512)
                         log.AppendLine("[警告] 512³ 分辨率下已自动跳过 SDF 平滑以控制内存峰值(<2GB)");
+                    if (settings.UseSDF && gpuSdfDone)
+                        log.AppendLine("[M5] SDF 平滑已在 GPU 完成(填充前执行,规格 §2.2 GPU 路径)");
                     if (applySdf)
                     {
                         var sdfFiltered = new NativeArray<int>(grid.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
@@ -250,7 +274,7 @@ namespace Splat2Play.Runtime
                             Mesh = mesh,
                             NavigationMesh = navMesh,
                             SceneBounds = new Bounds((pctMin + pctMax) * 0.5f, pctMax - pctMin), // 百分位盒:有意义的玩法范围
-                            SplatCount = header.SplatCount,
+                            SplatCount = splatCount,
                             TriangleCount = collTris,
                             NavTriangleCount = navTris,
                             VoxelResolution = res,

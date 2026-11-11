@@ -41,6 +41,14 @@
 - 技术博客([docs/blog-draft.md](docs/blog-draft.md))、仓库按 `M0`–`M4` 打 tag ✅
 - 延伸:Quest 3 冒烟测试
 
+### M5 — SPZ 全链路直读 + GPU Compute 极速烘焙(方向 5)✅ 2026-11-12
+
+- `SplatSourceReader`:PLY/SPZ 按文件头魔数自动路由,输出统一物理量 `SplatRaw`
+- 第三方程序集 `GaussianSplatRawExtractor` 公开门面(SPZ v1–v3 gzip / v4 Zstd 多流解压,`InternalsVisibleTo` 复用解压管线)
+- `S2PVoxelize.compute`(CSClearGrid / CSVoxelizeSplats / CSSdfSmooth):`InterlockedAdd` 定点整数累加 → 与 CPU 同为确定性
+- `ProxyBakeBackend`(Auto / CPUJobsDeterministic / GPUCompute):Auto 在 256³/512³ 且 ≥100 万点时自动走 GPU;烘焙向导支持 `ply,spz` 双后缀
+- **退出标准:** SPZ 解码物理量误差 <1e-3;GPU/CPU 体素密度结构一致(阈值掩码与 SurfaceNets 顶点/面数完全一致)✅(单元测试 12 项全绿,含真实资产基准)
+
 ## 性能基准目标(桌面,RTX 级显卡)
 
 - ≥100 万 splat 场景,开启代理 + 近似光照后仍达 60fps

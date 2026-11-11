@@ -1,0 +1,180 @@
+// Splat2Play — M5(方向 5)T5.2:GPU Compute 体素化 + SDF 平滑后端
+// 与 CPU 管线(ProxyBakeJobs.cs)逐条对齐的确定性 GPU 实现:
+//   1) CSClearGrid     —— 清零 Q16.16 定点密度场
+//   2) CSVoxelizeSplats—— 每 splat 向其 3σ 包围盒覆盖的体素 InterlockedAdd 贡献
+//                         (整数原子累加与线程顺序无关 → 与 CPU VoxelizeJob 同为确定性)
+//   3) CSSdfSmooth     —— 3×3×3 [1,2,1]³/64 整数卷积核(src→dst 双缓冲,与 CPU SdfSmoothJob 位精确一致)
+// SPDX-License-Identifier: MIT
+
+#pragma kernel CSClearGrid
+#pragma kernel CSVoxelizeSplats
+#pragma kernel CSSdfSmooth
+
+// 烘焙输入 splat(与 C# S2PGpuVoxelBaker.SplatGpuIn 布局一致,48 字节)
+struct SplatGpuIn
+{
+    float3 pos;
+    float3 scale;
+    float4 rot;      // xyzw
+    float opacity;   // 已激活 [0,1]
+    float pad;
+};
+
+// 排除区包围盒(与 C# AabbGpu 布局一致,32 字节;xyz 有效,w 保留)
+struct AabbGpu
+{
+    float4 minBox;
+    float4 maxBox;
+};
+
+StructuredBuffer<SplatGpuIn> _Splats;
+StructuredBuffer<AabbGpu> _Exclusions;
+int _SplatCount;         // 当前派发批次的 splat 数
+uint _SplatDispatchOffset; // 当前批次在全局 splat 数组中的起始偏移(分批防 TDR)
+int _ExclusionCount;
+
+float3 _GridMin;     // 网格最小角(体素中心 = min + (i+0.5)*step)
+float _GridStep;     // 体素尺寸
+int _GridN;          // 每轴体素数
+float _OpacityWeight;
+
+// 512³ 密度场达 512MB:RWStructuredBuffer 在部分驱动上创建/写入触发设备移除,
+// 改用 RWByteAddressBuffer(Raw,4 字节寻址)——D3D12 大 UAV 的稳健路径
+RWByteAddressBuffer _DensityQ16;       // 65536 = 密度 1.0
+RWByteAddressBuffer _SdfSrc;           // SDF 平滑源(双缓冲)
+RWByteAddressBuffer _SdfDst;           // SDF 平滑目标
+
+// 3σ 截断:d² > 9 的贡献 < 1.2%·opacity,忽略(与 CPU kMaxD2 一致)
+static const float kMaxD2 = 9.0;
+
+float3x3 QuaternionToMatrix(float4 q)
+{
+    // xyzw 四元数 → 旋转矩阵(与 CPU VoxelizeJob.QuaternionToMatrix 的列布局一致)
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    return float3x3(
+        1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w),
+        2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w),
+        2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y));
+}
+
+[numthreads(64, 1, 1)]
+void CSClearGrid(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID)
+{
+    // 每组负责 4096 个连续体素(组内 64 线程 × 步进 64):全局写入量恰为 count,
+    // 避免"每线程扫到缓冲区末尾"的过量写放大(512³ 下曾达 4.3 万亿次 → TDR)
+    uint count = (uint)(_GridN * _GridN * _GridN);
+    uint start = group.x * 4096u + thread.x;
+    uint end = min(start + 4096u, count);
+    for (uint i = start; i < end; i += 64u)
+        _DensityQ16.Store(i * 4, 0);
+}
+
+[numthreads(256, 1, 1)]
+void CSVoxelizeSplats(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_SplatCount)
+        return;
+
+    SplatGpuIn s = _Splats[_SplatDispatchOffset + i];
+
+    // 排除区:中心点命中即整体剔除(与 CPU 一致)
+    [loop]
+    for (int e = 0; e < _ExclusionCount; ++e)
+    {
+        if (all(s.pos >= _Exclusions[e].minBox.xyz) && all(s.pos <= _Exclusions[e].maxBox.xyz))
+            return;
+    }
+
+    float op = s.opacity * _OpacityWeight;
+    if (op < 0.005)
+        return;
+
+    float3 scale = max(s.scale, 1e-5);
+    float3x3 r = QuaternionToMatrix(s.rot);
+    // 椭球沿世界各轴的支撑半宽 = Σ_k |R_ik|·σ_k × 3(r 为行主序,第 i 列 = r[?][i])
+    float3 halfExt = (abs(float3(r[0].x, r[1].x, r[2].x)) * scale.x +
+                      abs(float3(r[0].y, r[1].y, r[2].y)) * scale.y +
+                      abs(float3(r[0].z, r[1].z, r[2].z)) * scale.z) * 3.0;
+
+    float3 lo = (s.pos - halfExt - _GridMin) / _GridStep;
+    float3 hi = (s.pos + halfExt - _GridMin) / _GridStep;
+    // 整个 3σ AABB 在网格外(如天空离群点)→ 跳过,避免钳位后堆积到边角体素
+    if (any(lo > float3(_GridN - 1, _GridN - 1, _GridN - 1)) || any(hi < 0.0))
+        return;
+    int3 iLo = clamp((int3)floor(lo), 0, _GridN - 1);
+    int3 iHi = clamp((int3)floor(hi), 0, _GridN - 1);
+
+    // 单轴跨度限制 ≤ 32:防退化巨型椭球(离群噪声)卡死 GPU TDR(§2.2 规格要求)
+    if (any(iHi - iLo > 31))
+    {
+        int3 center = (iLo + iHi) >> 1;
+        iLo = max(iLo, center - 16);
+        iHi = min(iHi, center + 15);
+    }
+
+    float3 invSigma = 1.0 / scale;
+    // 与 CPU VoxelizeJob 的 t 构造逐位一致:
+    // t 的第 j 列 = (rInv 的第 j 列)·(1/σ_j),q = mul(t, d) —— 实现语义(而非注释意图)以
+    // 保证 GPU/CPU 密度差 ≤ 1 LSB 的验收目标;r[k] 为第 k 行(标准行主序)。
+    float3x3 t = float3x3(r[0] * invSigma, r[1] * invSigma, r[2] * invSigma);
+
+    int n = _GridN;
+    int n2 = n * n;
+    for (int z = iLo.z; z <= iHi.z; ++z)
+    for (int y = iLo.y; y <= iHi.y; ++y)
+    for (int x = iLo.x; x <= iHi.x; ++x)
+    {
+        float3 d = _GridMin + (float3(x, y, z) + 0.5) * _GridStep - s.pos;
+        float3 q = mul(t, d);
+        float d2 = dot(q, q);
+        if (d2 > kMaxD2)
+            continue;
+        float w = op * exp(-d2 * 0.5);
+        int add = (int)(w * 65536.0 + 0.5);
+        if (add <= 0)
+            continue;
+        _DensityQ16.InterlockedAdd((uint)((x + y * n + z * n2) * 4), add);
+    }
+}
+
+[numthreads(8, 8, 4)]
+void CSSdfSmooth(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x, y = (int)id.y, z = (int)id.z;
+    int n = _GridN;
+    if (x >= n || y >= n || z >= n)
+        return;
+    int n2 = n * n;
+
+    int x0 = max(x - 1, 0), x2 = min(x + 1, n - 1);
+    int y0 = max(y - 1, 0), y2 = min(y + 1, n - 1);
+    int z0 = max(z - 1, 0), z2 = min(z + 1, n - 1);
+
+    int centerIdx = x + y * n + z * n2;
+    // bit31 为 outside 标记(填充阶段才会置位),平滑时原样保留
+    int outsideFlag = _SdfSrc.Load(centerIdx * 4) & (-2147483647 - 1); // 0x80000000
+
+    // 3×3×3 二项式核 [1,2,1]³ / 64:权重 = wz * wy * (d0 + 2*d1 + d2)
+    int sum = 0;
+    [unroll]
+    for (int dz = -1; dz <= 1; ++dz)
+    {
+        int zz = dz < 0 ? z0 : (dz == 0 ? z : z2);
+        int wz = dz == 0 ? 2 : 1;
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            int yy = dy < 0 ? y0 : (dy == 0 ? y : y2);
+            int wyz = wz * (dy == 0 ? 2 : 1);
+            int rowBase = yy * n + zz * n2;
+            int d0 = min(_SdfSrc.Load((x0 + rowBase) * 4) & 0x7FFFFFFF, 131072);
+            int d1 = min(_SdfSrc.Load((x + rowBase) * 4) & 0x7FFFFFFF, 131072);
+            int d2v = min(_SdfSrc.Load((x2 + rowBase) * 4) & 0x7FFFFFFF, 131072);
+            sum += wyz * (d0 + 2 * d1 + d2v);
+        }
+    }
+
+    int smoothed = (sum + 32) >> 6;
+    _SdfDst.Store(centerIdx * 4, smoothed | outsideFlag);
+}

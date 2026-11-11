@@ -31,8 +31,8 @@ namespace Splat2Play.Editor
         void OnGUI()
         {
             EditorGUILayout.HelpBox(
-                "流程:① PLY 路径(或选中场景里的 GaussianSplatRenderer 自动取路径)\n" +
-                "② 烘焙参数 + T1.7 场景盒体可视化微调 → Bake\n" +
+                "流程:① PLY/SPZ 路径(或选中场景里的 GaussianSplatRenderer 自动取路径)\n" +
+                "② 烘焙参数 + 后端选择(CPU 确定性 / GPU Compute)+ T1.7 场景盒体可视化微调 → Bake\n" +
                 "③ 自动生成 ProxyData 资产并在场景中一键装配 SplatLevel(碰撞 + NavMesh + 流送 + 性能面板)",
                 MessageType.Info);
 
@@ -40,10 +40,11 @@ namespace Splat2Play.Editor
                 "场景 splat 渲染器(可选)", _targetRenderer, typeof(GaussianSplatRenderer), true);
 
             EditorGUILayout.BeginHorizontal();
-            _plyPath = EditorGUILayout.TextField("PLY 路径", _plyPath);
+            _plyPath = EditorGUILayout.TextField("扫描资产路径", _plyPath);
             if (GUILayout.Button("浏览", GUILayout.Width(48)))
             {
-                string picked = EditorUtility.OpenFilePanel("选择 3DGS PLY", "", "ply");
+                // M5:同时支持未压缩 .ply 与压缩 .spz(体积小 ~10×)
+                string picked = EditorUtility.OpenFilePanel("选择 3DGS PLY / SPZ", "", "ply,spz");
                 if (!string.IsNullOrEmpty(picked)) _plyPath = picked;
             }
             EditorGUILayout.EndHorizontal();
@@ -102,7 +103,7 @@ namespace Splat2Play.Editor
             }
             if (kind == 0) _settings.ExclusionVolumes.Add(new Bounds(center, Vector3.one * 2f));
             else if (kind == 1) _settings.SealVolumes.Add(new Bounds(center, new Vector3(1.5f, 2.2f, 0.4f)));
-            else _settings.PatchBoxes.Add(new ProxyBakeSettings.PatchBox { Center = center, Size = new Vector3(2f, 0.2f, 2f), RotationEuler = Vector3.zero });
+            else if (kind == 2) _settings.PatchBoxes.Add(new ProxyBakeSettings.PatchBox { Center = center, Size = new Vector3(2f, 0.2f, 2f), RotationEuler = Vector3.zero });
             EditorUtility.SetDirty(_settings);
             SceneView.RepaintAll();
         }
@@ -172,6 +173,7 @@ namespace Splat2Play.Editor
                         EditorUtility.SetDirty(_settings);
                     }
                 }
+
             }
         }
 

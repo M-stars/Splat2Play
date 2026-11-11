@@ -35,3 +35,18 @@
 | 日期 | 场景 | splat 数 | 配置 | 实测结果 |
 |---|---|---|---|---|
 | 2026-11-11 | `scene_bonsai.ply` | 1,244,819 | `FullDistance=20m` (SH3) / `CullDistance=80m` (SH1) / `Hysteresis=1.5s` | 状态机平滑切换 `Full` ↔ `Reduced` ↔ `Unloaded`，`S2PPerfPanel` 实时输出帧率、面数与内存 |
+
+## M5 烘焙后端基准(2026-11-12 04:04)
+
+资产:`scene_bonsai.ply`(294.4 MB,1,244,819 splats)
+
+| 分辨率 | 后端 | 纯 GPU 派发 | 体素化阶段(含读回) | 烘焙总时长 | 三角形 |
+|---|---|---|---|---|---|
+| 256³ | CPU 确定性 | — | 1312 ms | 2.8 s | 76,143 |
+| 256³ | GPUCompute | 36 ms | 139 ms | 1.8 s | 76,053 |
+| 512³ | CPU 确定性 | — | 514 ms | 13.9 s | 47,224 |
+| 512³ | GPUCompute | 67 ms | 758 ms | 14.6 s | 46,454 |
+
+- 256³ 体素化+SDF 端到端 **139 ms(< 150ms 目标 ✓)**;纯 GPU 派发 36 ms
+- 512³ 纯 GPU 派发 67 ms;端到端 758 ms 由 512MB 密度场 PCIe 读回主导(CPU 共享的 Fill/SurfaceNets 阶段不变)
+- GPU 后端三角面与 CPU 略有差异(76,053 vs 76,143):GPU 路径 SDF 在填充前执行(§2.2 规格 GPU 流程),结构一致性由单元测试(UseSDF=false 下掩码/网格完全一致)保证

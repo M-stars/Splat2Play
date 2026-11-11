@@ -7,10 +7,27 @@ using UnityEngine;
 
 namespace Splat2Play.Runtime
 {
+    /// <summary>
+    /// M5(方向 5)T5.3:烘焙计算后端。
+    /// Auto:系统自动选择(支持 Compute 且 256³/512³ 且点数 ≥ 100 万时走 GPU,否则 CPU);
+    /// CPUJobsDeterministic:现有 Burst/Q16.16 定点管线(单元测试与无 Compute 环境的确定性回退路径);
+    /// GPUCompute:强制 GPU(不支持时告警并回退 CPU)。
+    /// </summary>
+    public enum ProxyBakeBackend
+    {
+        Auto = 0,
+        CPUJobsDeterministic = 1,
+        GPUCompute = 2
+    }
+
     /// <summary>烘焙参数(§5.1 参数表)。ScriptableObject 以便向导窗口持久化预设。</summary>
     [CreateAssetMenu(menuName = "Splat2Play/Proxy Bake Settings", fileName = "ProxyBakeSettings")]
     public sealed class ProxyBakeSettings : ScriptableObject
     {
+        [Header("后端")]
+        [Tooltip("M5 烘焙后端:Auto(按硬件与规模自动)/ CPUJobsDeterministic(Burst 确定性)/ GPUCompute。")]
+        public ProxyBakeBackend Backend = ProxyBakeBackend.Auto;
+
         [Header("体素化")]
         [Tooltip("密度场每轴体素数(64–512)。越大越精细,内存与耗时按立方增长。")]
         public int VoxelResolution = 256;
