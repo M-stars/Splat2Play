@@ -57,6 +57,78 @@ uint _SHOnly;
 RWStructuredBuffer<uint> _S2PChunkVisibleFlags;
 uint _S2PUseGpuChunkCull;
 
+// —— S2P M7:多光源方向性动态重光照(由 S2PLightModulationDriver 每帧注入,上限 8 盏)——
+// A: xyz=光源世界坐标, w=1/range²
+// B: xyz=朝向(单位向量), w=cos(半锥角);w < -0.999 表示点光源
+// C: rgb=线性颜色×强度, w=shininess(如 16..64)
+float4 _S2PGpuLightA[8];
+float4 _S2PGpuLightB[8];
+float4 _S2PGpuLightC[8];
+int _S2PDynamicLightCount;
+float _S2PPerSplatLightStrength;
+float _S2PSplatNormalWeight;
+
+void DecomposeCovariance(float3 cov2d, out float2 v1, out float2 v2)
+{
+    #if 0 // does not quite give the correct results?
+
+    // https://jsfiddle.net/mattrossman/ehxmtgw6/
+    // References:
+    // - https://www.youtube.com/watch?v=e50Bj7jn9IQ
+    // - https://en.wikipedia.org/wiki/Eigenvalue_algorithm#2%C3%972_matrices
+    // - https://people.math.harvard.edu/~knill/teaching/math21b2004/exhibits/2dmatrices/index.html
+    float a = cov2d.x;
+    float b = cov2d.y;
+    float d = cov2d.z;
+    float det = a * d - b * b; // matrix is symmetric, so "c" is same as "b"
+    float trace = a + d;
+
+    float mean = 0.5 * trace;
+    float dist = sqrt(mean * mean - det);
+
+    float lambda1 = mean + dist; // 1st eigenvalue
+    float lambda2 = mean - dist; // 2nd eigenvalue
+
+    if (b == 0) {
+        // https://twitter.com/the_ross_man/status/1706342719776551360
+        if (a > d) v1 = float2(1, 0);
+        else v1 = float2(0, 1);
+    } else
+        v1 = normalize(float2(b, d - lambda2));
+
+    v1.y = -v1.y;
+    // The 2nd eigenvector is just a 90 degree rotation of the first since Gaussian axes are orthogonal
+    v2 = float2(v1.y, -v1.x);
+
+    // scaling components
+    v1 *= sqrt(lambda1);
+    v2 *= sqrt(lambda2);
+
+    float radius = 1.5;
+    v1 *= radius;
+    v2 *= radius;
+
+    #else
+
+    // same as in antimatter15/splat
+    float diag1 = cov2d.x, diag2 = cov2d.z, offDiag = cov2d.y;
+    float mid = 0.5f * (diag1 + diag2);
+    float radius = length(float2((diag1 - diag2) / 2.0, offDiag));
+    float lambda1 = mid + radius;
+    float lambda2 = max(mid - radius, 0.1);
+
+    // diagonal covariance already has axis-aligned eigenvectors, avoid normalizing (0,0)
+    float2 diagVec = offDiag == 0
+        ? (diag1 >= diag2 ? float2(1, 0) : float2(0, 1))
+        : normalize(float2(offDiag, lambda1 - diag1));
+    diagVec.y = -diagVec.y;
+    float maxSize = 4096.0;
+    v1 = min(sqrt(2.0 * lambda1), maxSize) * diagVec;
+    v2 = min(sqrt(2.0 * lambda2), maxSize) * float2(diagVec.y, -diagVec.x);
+
+    #endif
+}
+
 [numthreads(GROUP_SIZE,1,1)]
 void CSCalcViewData (uint3 id : SV_DispatchThreadID)
 {
@@ -131,6 +203,47 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
             col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
             col.a = min(splat.opacity * opacityScale, 65000);
 
+            // —— S2P M7 T7.1/T7.2:最短轴法线 + 多光源 Lambert/Blinn-Phong 动态重光照 ——
+            if (_S2PDynamicLightCount > 0 && _S2PPerSplatLightStrength > 0.0)
+            {
+                float3x3 o2wIT = transpose((float3x3)_MatrixWorldToObject);
+                float3 nWorld;
+                float flatness;
+                ExtractSplatNormalAndFlatness(splat.rot, splat.scale, o2wIT, worldViewDir, nWorld, flatness);
+                float3 vDir = normalize(worldViewDir);
+                // flatness 关键权重:扁平硬表面 → 完全按法线;球状雾气/绒毛(flatness→0)→ 退化为无方向项,避免噪点
+                float normalWeight = flatness * _S2PSplatNormalWeight;
+                [loop]
+                for (int li = 0; li < _S2PDynamicLightCount; ++li)
+                {
+                    float3 lVec = _S2PGpuLightA[li].xyz - centerWorldPos;
+                    float distSq = dot(lVec, lVec);
+                    float dist = sqrt(distSq);
+                    float3 L = dist > 1e-5 ? lVec / dist : float3(0.0, 1.0, 0.0);
+                    // 平方衰减:t = saturate(1 - d²/range²),atten = t²
+                    float tAtten = saturate(1.0 - distSq * _S2PGpuLightA[li].w);
+                    float atten = tAtten * tAtten;
+                    // 聚光灯锥形(w < -0.999 为点光源)
+                    float cosHalf = _S2PGpuLightB[li].w;
+                    float spotFactor = cosHalf > -0.999
+                        ? smoothstep(cosHalf, cosHalf + 0.08, dot(L, _S2PGpuLightB[li].xyz))
+                        : 1.0;
+                    // Lambert 漫反射(flatness 混合)
+                    float ndotl = max(dot(nWorld, L), 0.0);
+                    float diffuseK = lerp(1.0, ndotl, normalWeight);
+                    // Blinn-Phong 镜面:shininess 随扁平度自适应(球状高斯无高光)
+                    float3 H = normalize(L + vDir);
+                    float shininess = lerp(1.0, _S2PGpuLightC[li].w, normalWeight);
+                    float spec = pow(saturate(dot(nWorld, H)), shininess) * normalWeight;
+                    float wLight = atten * spotFactor * _S2PPerSplatLightStrength;
+                    col.rgb += (_S2PGpuLightC[li].rgb * (diffuseK * col.rgb) + _S2PGpuLightC[li].rgb * spec) * wLight;
+                }
+            }
+            view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
+            view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
+        }
+    }
+    
     uint outputIndex = _SplatOffset + idx;
     _SplatViewData[outputIndex] = view;
     if (_WriteSortKeys != 0)

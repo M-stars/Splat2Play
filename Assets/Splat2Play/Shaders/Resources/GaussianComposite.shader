@@ -48,6 +48,14 @@ float4 _S2PChunkMax[8];     // xyz=max
 float4x4 _AdditionalLightsWorldToShadow[256];
 Texture2D _AdditionalLightsShadowmapTexture;
 
+// —— S2P M7:额外动态光源(逐像素回退路径;逐高斯路径启用时为 0,避免双重光照)——
+float4 _S2PGpuLightA[8];  // xyz=worldPos, w=1/range²
+float4 _S2PGpuLightB[8];  // xyz=forward, w=cos(半锥角);<-0.999 为点光源
+float4 _S2PGpuLightC[8];  // rgb=linearColor*intensity, w=shininess
+int _S2PDynamicLightCount;
+float _S2PPerSplatLightStrength;
+float _S2PSplatNormalWeight;
+
 float SampleS2PDepth(int2 xy)
 {
     int3 px = int3(xy, 0);
@@ -88,9 +96,11 @@ half4 frag (v2f i) : SV_Target
                 float atten = saturate(1.0 - dist / max(_S2PLightRange, 1.0));
                 atten *= atten;
 
-                // 屏幕空间深度差分重建代理法线并计算轻微 N·L 调制(§5.3)
+                // 屏幕空间深度差分重建代理法线(§5.3;M3 手电筒调制与 M7 附加光回退路径共用)
+                float3 ssNormal = float3(0.0, 1.0, 0.0);
+                bool hasSSNormal = false;
                 float nlFactor = 1.0;
-                if (_S2PNormalStrength > 0.001)
+                if (_S2PNormalStrength > 0.001 || (_S2PDynamicLightCount > 0 && _S2PPerSplatLightStrength < 0.001))
                 {
                     float dRight = SampleS2PDepth(pxi + int2(1, 0));
                     float dUp    = SampleS2PDepth(pxi + int2(0, 1));
@@ -98,8 +108,9 @@ half4 frag (v2f i) : SV_Target
                     {
                         float3 wRight = ReconstructS2PWorld(i.vertex.xy + float2(1.0, 0.0), dRight, size, projectionY);
                         float3 wUp    = ReconstructS2PWorld(i.vertex.xy + float2(0.0, 1.0), dUp,    size, projectionY);
-                        float3 nrm = normalize(cross(wUp - world, wRight - world));
-                        float ndotl = abs(dot(nrm, -ldir));
+                        ssNormal = normalize(cross(wUp - world, wRight - world));
+                        hasSSNormal = true;
+                        float ndotl = abs(dot(ssNormal, -ldir));
                         nlFactor = lerp(1.0, 0.45 + 0.55 * ndotl, _S2PNormalStrength);
                     }
                 }
@@ -137,6 +148,31 @@ half4 frag (v2f i) : SV_Target
                 float3 lightTint = any(_S2PLightColor > 0.0) ? _S2PLightColor : float3(1.0, 0.96, 0.9);
                 float ambient = _S2PAmbient > 0.0 ? _S2PAmbient : 0.35;
                 col.rgb = col.rgb * lerp(ambient, 1.0, saturate(cone * atten * lit)) + col.rgb * lightTint * factor;
+
+                // —— S2P M7:额外动态光源逐像素回退路径(逐高斯路径关闭时生效,与手电筒协同)——
+                if (_S2PDynamicLightCount > 0 && _S2PPerSplatLightStrength < 0.001 && hasSSNormal)
+                {
+                    float3 addLight = 0.0;
+                    [loop]
+                    for (int li = 0; li < 8; ++li)
+                    {
+                        if (li >= _S2PDynamicLightCount) break;
+                        float3 lVec = _S2PGpuLightA[li].xyz - world;
+                        float distSq = dot(lVec, lVec);
+                        float dist = sqrt(distSq);
+                        if (dist < 1e-5) continue;
+                        float3 L = lVec / dist;
+                        float tAtten = saturate(1.0 - distSq * _S2PGpuLightA[li].w);
+                        float lAtten = tAtten * tAtten;
+                        float cosHalf = _S2PGpuLightB[li].w;
+                        float spotFactor = cosHalf > -0.999
+                            ? smoothstep(cosHalf, cosHalf + 0.08, dot(L, _S2PGpuLightB[li].xyz))
+                            : 1.0;
+                        float ndl = max(abs(dot(ssNormal, L)), 0.0);
+                        addLight += _S2PGpuLightC[li].rgb * (ndl * lAtten * spotFactor);
+                    }
+                    col.rgb += col.rgb * addLight;
+                }
             }
         }
     }

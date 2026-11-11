@@ -49,9 +49,34 @@ namespace Splat2Play.Runtime
         [Tooltip("逐 Chunk 深度偏移微调列表(最多前 8 个生效,§5.3 T3.4)")]
         public List<ChunkBiasOverride> ChunkBiases = new();
 
+        [Header("M7 多光源逐高斯动态重光照")]
+        [Tooltip("额外动态点光源/聚光灯(上限 8;为空时自动收集场景中开启的灯,排除主手电筒与方向光)")]
+        public List<Light> AdditionalDynamicLights = new();
+        [Range(0f, 2f)] [Tooltip("逐高斯动态重光照总强度(0 = 关闭逐高斯路径,走合成器逐像素回退路径)")]
+        public float PerSplatLightStrength = 1f;
+        [Range(0f, 1f)] [Tooltip("最短轴法线项权重:1 = 完全按椭球法线着色,0 = 退化为无方向环境项")]
+        public float SplatNormalWeight = 0.9f;
+        [Range(1f, 128f)] [Tooltip("Blinn-Phong 基准 shininess(随高斯扁平度自适应缩放)")]
+        public float SpecularPower = 32f;
+
+        /// <summary>注入 GPU 的单盏动态光源(48 字节,3×float4)。</summary>
+        [Serializable]
+        public struct S2PGpuLight
+        {
+            public Vector4 PosAndInvRangeSq;     // xyz=worldPos, w=1/range²
+            public Vector4 DirAndCosHalfAngle;   // xyz=forward(单位), w=cos(spotAngle*0.5);<-0.999 表示点光源
+            public Vector4 ColorAndSpecPower;    // rgb=linearColor*intensity, w=shininess(如 16..64)
+        }
+
+        const int kMaxLights = 8;
         const int kMaxChunkBiases = 8;
         readonly Vector4[] _chunkMinBias = new Vector4[kMaxChunkBiases];
         readonly Vector4[] _chunkMax = new Vector4[kMaxChunkBiases];
+        readonly Vector4[] _lightA = new Vector4[kMaxLights];
+        readonly Vector4[] _lightB = new Vector4[kMaxLights];
+        readonly Vector4[] _lightC = new Vector4[kMaxLights];
+        Light[] _autoLightsCache = Array.Empty<Light>();
+        float _nextLightCollectTime;
 
         public void SetGlobalsNow()
         {
@@ -93,6 +118,58 @@ namespace Splat2Play.Runtime
                 Shader.SetGlobalVectorArray("_S2PChunkMinBias", _chunkMinBias);
                 Shader.SetGlobalVectorArray("_S2PChunkMax", _chunkMax);
             }
+
+            PackDynamicLights();
+        }
+
+        /// <summary>
+        /// M7 T7.2:收集并打包额外动态光源(上限 8),通过 Shader.SetGlobalVectorArray
+        /// 注入 CSCalcViewData(逐高斯路径)与 GaussianComposite(逐像素回退路径)。
+        /// 主手电筒不参与(保留 M3 屏幕空间阴影路径,避免双重光照);方向光属于环境 SH 也不参与。
+        /// </summary>
+        void PackDynamicLights()
+        {
+            IEnumerable<Light> source;
+            if (AdditionalDynamicLights != null && AdditionalDynamicLights.Count > 0)
+            {
+                source = AdditionalDynamicLights;
+            }
+            else
+            {
+                // 自动收集:0.5s 节流,避免每帧 FindObjectsByType 开销
+                if (Time.unscaledTime >= _nextLightCollectTime)
+                {
+                    _autoLightsCache = UnityEngine.Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
+                    _nextLightCollectTime = Time.unscaledTime + 0.5f;
+                }
+                source = _autoLightsCache;
+            }
+
+            int n = 0;
+            foreach (var l in source)
+            {
+                if (n >= kMaxLights) break;
+                if (l == null || !l.isActiveAndEnabled) continue;
+                if (l == Flashlight) continue;
+                if (l.type != LightType.Point && l.type != LightType.Spot) continue;
+                var t = l.transform;
+                float range = Mathf.Max(0.05f, l.range);
+                Color c = l.color.linear * Mathf.Max(0f, l.intensity);
+                _lightA[n] = new Vector4(t.position.x, t.position.y, t.position.z, 1f / (range * range));
+                _lightB[n] = new Vector4(t.forward.x, t.forward.y, t.forward.z,
+                    l.type == LightType.Spot ? Mathf.Cos(l.spotAngle * 0.5f * Mathf.Deg2Rad) : -1f);
+                _lightC[n] = new Vector4(c.r, c.g, c.b, Mathf.Clamp(SpecularPower, 1f, 128f));
+                ++n;
+            }
+            Shader.SetGlobalInt("_S2PDynamicLightCount", n);
+            Shader.SetGlobalFloat("_S2PPerSplatLightStrength", PerSplatLightStrength);
+            Shader.SetGlobalFloat("_S2PSplatNormalWeight", SplatNormalWeight);
+            if (n > 0)
+            {
+                Shader.SetGlobalVectorArray("_S2PGpuLightA", _lightA);
+                Shader.SetGlobalVectorArray("_S2PGpuLightB", _lightB);
+                Shader.SetGlobalVectorArray("_S2PGpuLightC", _lightC);
+            }
         }
 
         void LateUpdate()
@@ -106,6 +183,7 @@ namespace Splat2Play.Runtime
         {
             if (Flashlight != null) S2PLightProxyRegistry.UnregisterSpotLight(Flashlight);
             Shader.SetGlobalInt("_S2PLightEnabled", 0);
+            Shader.SetGlobalInt("_S2PDynamicLightCount", 0);
         }
     }
 }

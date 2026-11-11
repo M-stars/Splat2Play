@@ -57,6 +57,13 @@
 - `DrawProceduralIndirect`:GPU 侧 `InterlockedAdd` 精确累加可见实例数,仅绘制可见 splat;性能面板显示 GPU 剔除精确计数
 - **退出标准:** Morton 重排双射无丢失 + Chunk AABB 包含性 + 键有序 ✅(单元测试);运行时墙面视角可见 Chunk 下降(性能面板验证)
 
+### M7 — 椭球最短轴法线 + 多光源 SH 方向性动态重光照(方向 2)✅ 2026-11-12
+
+- `ExtractSplatNormalAndFlatness`(HLSL + C# 镜像):最短尺度轴即表面法线,flatness∈[0,1] 置信度,视线侧双面翻转
+- 逐高斯多光源 Lambert/Blinn-Phong:`S2PGpuLight`(≤8 盏)经 `Shader.SetGlobalVectorArray` 注入,shininess 随扁平度自适应
+- 与 M3 解耦:主手电筒保留屏幕空间真实阴影;附加灯提供"逐高斯"与"逐像素回退"互斥双路径(避免双重光照)
+- **退出标准:** 扁平圆盘→(0,1,0)/flatness>0.95、球状→flatness=0、旋转对齐、双面翻转 ✅(单元测试 4 项全绿)
+
 ## 性能基准目标(桌面,RTX 级显卡)
 
 - ≥100 万 splat 场景,开启代理 + 近似光照后仍达 60fps

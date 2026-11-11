@@ -780,5 +780,59 @@ namespace Splat2Play.Tests
             }
         }
 
+        // ==================== M7(方向 2):椭球最短轴法线提取 ====================
+
+        [Test]
+        public void SplatNormal_FlatDiscUp_ReturnsUpNormalWithHighFlatness()
+        {
+            // 水平放置的扁平圆盘:scale=(0.5, 0.01, 0.5),单位旋转 → 法线严格 (0,1,0)
+            var scale = new float3(0.5f, 0.01f, 0.5f);
+            var rot = new float4(0f, 0f, 0f, 1f);
+            SplatNormalMath.ExtractNormalAndFlatness(rot, scale, float3x3.identity,
+                new float3(0.3f, 2f, -0.2f), out var normal, out var flatness);
+            Assert.That(normal.x, Is.EqualTo(0f).Within(1e-5), "X 分量应为 0");
+            Assert.That(normal.y, Is.EqualTo(1f).Within(1e-5), "法线应严格朝上(视线侧)");
+            Assert.That(normal.z, Is.EqualTo(0f).Within(1e-5), "Z 分量应为 0");
+            Assert.Greater(flatness, 0.95f, $"扁平圆盘的 flatness 应 > 0.95,实际 {flatness}");
+        }
+
+        [Test]
+        public void SplatNormal_Sphere_HasZeroFlatness()
+        {
+            // 各向同性球状高斯(雾气)没有明确表面朝向 → flatness == 0
+            var scale = new float3(0.2f, 0.2f, 0.2f);
+            var rot = new float4(0f, 0f, 0f, 1f);
+            SplatNormalMath.ExtractNormalAndFlatness(rot, scale, float3x3.identity,
+                new float3(0f, 1f, 0f), out _, out var flatness);
+            Assert.That(flatness, Is.EqualTo(0f).Within(1e-6), "球状高斯的 flatness 应为 0");
+        }
+
+        [Test]
+        public void SplatNormal_RotatedDisc_AlignsWithShortestWorldAxis()
+        {
+            // 圆盘绕 Z 轴旋转 90°:最短轴(Y)旋转到世界 X → 法线为 ±X,并朝视线侧翻转
+            var scale = new float3(0.5f, 0.01f, 0.5f);
+            float ang = 90f * math.TORADIANS;
+            var rot = math.normalize(new float4(0f, 0f, math.sin(ang * 0.5f), math.cos(ang * 0.5f))); // (x,y,z,w) 绕 Z
+            // 视线沿 -X 方向看向圆盘(相机在 +X 侧)
+            SplatNormalMath.ExtractNormalAndFlatness(rot, scale, float3x3.identity,
+                new float3(2f, 0.1f, 0f), out var normal, out var flatness);
+            Assert.That(math.abs(normal.x), Is.GreaterThan(0.99f), $"法线应与世界 X 轴对齐,实际 {normal}");
+            Assert.That(math.abs(normal.y), Is.LessThan(0.02f), "Y 分量应接近 0");
+            Assert.Greater(flatness, 0.95f, "旋转不应影响扁平度");
+            Assert.Greater(normal.x, 0f, "法线应翻转朝向相机(+X 侧)");
+        }
+
+        [Test]
+        public void SplatNormal_FlipsTowardViewDirection()
+        {
+            // 双面一致:同一圆盘从下方观察时法线应翻转为 (0,-1,0)
+            var scale = new float3(0.5f, 0.01f, 0.5f);
+            var rot = new float4(0f, 0f, 0f, 1f);
+            SplatNormalMath.ExtractNormalAndFlatness(rot, scale, float3x3.identity,
+                new float3(0f, -1f, 0f), out var normal, out _);
+            Assert.That(normal.y, Is.EqualTo(-1f).Within(1e-5), "从下方观察法线应翻转朝下");
+        }
+
     }
 }

@@ -244,6 +244,43 @@ struct SplatViewData
     uint2 color; // 4xFP16
 };
 
+// ==================== S2P M7(方向 2):椭球最短轴法线提取 ====================
+// 3DGS 训练收敛后,表面高斯退化为贴合表面的扁平圆盘(Disc):三维尺度 s 中
+// 最小分量的局部坐标轴经旋转四元数变换后即该高斯的物理表面法线。
+// flatness ∈ [0,1] 为法线置信度:越扁平越接近真实硬表面;球状雾气 → 0。
+void ExtractSplatNormalAndFlatness(
+    float4 rot, float3 scale, float3x3 objToWorldIT, float3 worldViewDir,
+    out float3 worldNormal, out float flatness)
+{
+    float3x3 R = CalcMatrixFromRotationScale(rot, float3(1, 1, 1));
+    // 找到最小尺度的轴索引(其旋转后的列向量即表面法线)
+    float3 localAxis;
+    float sMin, sMid;
+    if (scale.x <= scale.y && scale.x <= scale.z)
+    {
+        localAxis = float3(R._m00, R._m10, R._m20);
+        sMin = scale.x; sMid = min(scale.y, scale.z);
+    }
+    else if (scale.y <= scale.x && scale.y <= scale.z)
+    {
+        localAxis = float3(R._m01, R._m11, R._m21);
+        sMin = scale.y; sMid = min(scale.x, scale.z);
+    }
+    else
+    {
+        localAxis = float3(R._m02, R._m12, R._m22);
+        sMin = scale.z; sMid = min(scale.x, scale.y);
+    }
+
+    worldNormal = normalize(mul(objToWorldIT, localAxis));
+    // 朝向视线侧翻转(双面一致),避免单向法线翻转造成黑斑
+    if (dot(worldNormal, worldViewDir) < 0.0)
+        worldNormal = -worldNormal;
+
+    // 扁平度:越扁平越接近硬表面,法线置信度越高;球状雾气 flatness → 0
+    flatness = saturate(1.0 - sMin / max(sMid, 1e-5));
+}
+
 // If we are rendering into backbuffer directly (e.g. HDR off, no postprocessing),
 // the color target texture is a render target (so projection is upside down),
 // but the depth buffer we get is not upside down. We want to flip
