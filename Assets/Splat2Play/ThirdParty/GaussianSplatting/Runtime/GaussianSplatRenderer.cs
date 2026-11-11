@@ -50,6 +50,15 @@ namespace GaussianSplatting.Runtime
         const int kGpuViewDataSize = 28;
         GaussianSplatTemporalAccumulator m_TemporalAccumulator;
         int m_SceneVersion;
+        // —— S2P M6 GPU 分块剔除 ——
+        ComputeShader m_CullingCS;
+        RenderTexture m_HiZPyramid;
+        ComputeBuffer m_IndirectArgs;
+        bool m_CullingResourceMissing;
+        /// <summary>本帧 GPU 分块剔除是否生效(存在全部带分块的活跃渲染器)。</summary>
+        internal bool GpuChunkCullingActive { get; private set; }
+        /// <summary>本帧 GPU 剔除后的可见 splat 总数(GPU 侧精确累加,间接绘制用)。</summary>
+        internal int GpuCullingVisibleSplatTotal { get; private set; } = -1;
 #if UNITY_EDITOR
         readonly HashSet<Camera> m_RenderedSceneViews = new();
 #endif
@@ -117,6 +126,9 @@ namespace GaussianSplatting.Runtime
             UnityEngine.Object.DestroyImmediate(m_MatComposite);
             UnityEngine.Object.DestroyImmediate(m_MatDebugPoints);
             Camera.onPreCull -= OnPreCullCamera;
+            m_HiZPyramid?.Release(); m_HiZPyramid = null;
+            m_CullingCS = null;
+            GpuChunkCullingActive = false;
             m_TemporalAccumulator?.Dispose();
             m_TemporalAccumulator = null;
 #if UNITY_EDITOR
@@ -135,6 +147,7 @@ namespace GaussianSplatting.Runtime
             m_GpuSortKeys?.Dispose(); m_GpuSortKeys = null;
             m_SorterArgs.resources.Dispose();
             m_SorterArgs = default;
+            m_IndirectArgs?.Dispose(); m_IndirectArgs = null;
         }
 
         void EnsureSplatBuffers()
@@ -285,6 +298,121 @@ namespace GaussianSplatting.Runtime
             cmb.EndSample(GaussianSplatRenderer.s_ProfSort);
         }
 
+        // ==================== S2P M6:GPU 分块剔除(视锥 + Hi-Z)====================
+
+        const int kKernelHiZMip0 = 0;
+        const int kKernelHiZDownsample = 1;
+        const int kKernelResetIndirectArgs = 2;
+        const int kKernelCullChunks = 3;
+        const int kHiZWidth = 256, kHiZHeight = 128;
+
+        /// <summary>
+        /// 在 CalcViewData 之前调用:构建 Hi-Z 金字塔(Reversed-Z 取 Min),
+        /// 逐渲染器派发 CSCullChunks(视锥 + 屏幕投影 AABB 深度比较),并重置/累加间接绘制参数。
+        /// 调用方(URP Feature)需先将相机深度纹理绑定为全局 "_S2PHiZSrcDepth"。
+        /// </summary>
+        internal void DispatchGpuChunkCulling(CommandBuffer cmb, Matrix4x4 gpuProjection, Matrix4x4 viewMatrix,
+                                              int camWidth, int camHeight)
+        {
+            GpuChunkCullingActive = false;
+            GpuCullingVisibleSplatTotal = -1;
+            var options = GaussianSplatRenderingOptions.instance;
+            if (!options.m_GpuChunkCulling)
+                return;
+            // 全部活跃渲染器都有分块才启用(混合状态回退整幅全量绘制,保证正确性)
+            bool allChunked = m_ActiveSplats.Count > 0;
+            foreach (var (gs, _) in m_ActiveSplats)
+                if (gs.GpuChunkFlagsBuffer == null) { allChunked = false; break; }
+            if (!allChunked)
+                return;
+
+            if (m_CullingCS == null && !m_CullingResourceMissing)
+                m_CullingCS = Resources.Load<ComputeShader>("S2PGpuCulling");
+            if (m_CullingCS == null)
+            {
+                m_CullingResourceMissing = true;
+                return;
+            }
+            EnsureCullingResources();
+
+            // 1. Hi-Z 金字塔(源 = 全局 _S2PHiZSrcDepth;Reversed-Z 下 min = 区域内最远遮挡物)
+            cmb.SetComputeVectorParam(m_CullingCS, "_HiZSrcSize", new Vector4(camWidth, camHeight, 0, 0));
+            cmb.SetComputeTextureParam(m_CullingCS, kKernelHiZMip0, "_HiZDst", m_HiZPyramid, 0);
+            cmb.SetComputeVectorParam(m_CullingCS, "_HiZDstSize", new Vector4(kHiZWidth, kHiZHeight, 0, 0));
+            cmb.DispatchCompute(m_CullingCS, kKernelHiZMip0, (kHiZWidth + 7) / 8, (kHiZHeight + 7) / 8, 1);
+            int mipCount = CountMips(kHiZWidth, kHiZHeight);
+            for (int m = 1; m < mipCount; ++m)
+            {
+                int mw = Mathf.Max(kHiZWidth >> m, 1), mh = Mathf.Max(kHiZHeight >> m, 1);
+                cmb.SetComputeTextureParam(m_CullingCS, kKernelHiZDownsample, "_HiZPrev", m_HiZPyramid, m - 1);
+                cmb.SetComputeTextureParam(m_CullingCS, kKernelHiZDownsample, "_HiZDst", m_HiZPyramid, m);
+                cmb.SetComputeVectorParam(m_CullingCS, "_HiZDstSize", new Vector4(mw, mh, 0, 0));
+                cmb.DispatchCompute(m_CullingCS, kKernelHiZDownsample, (mw + 7) / 8, (mh + 7) / 8, 1);
+            }
+
+            // 2. 重置间接绘制参数
+            cmb.SetComputeBufferParam(m_CullingCS, kKernelResetIndirectArgs, "_S2PIndirectArgs", m_IndirectArgs);
+            cmb.SetComputeIntParam(m_CullingCS, "_S2PTotalSplatCount", m_SplatCount);
+            cmb.SetComputeIntParam(m_CullingCS, "_S2PArgsUseVisibleCount", options.needSorting ? 1 : 0);
+            cmb.DispatchCompute(m_CullingCS, kKernelResetIndirectArgs, 1, 1, 1);
+
+            // 3. 逐渲染器剔除(局部 AABB 经 VP*O2W 组合矩阵变换到裁剪空间)
+            Matrix4x4 viewProj = gpuProjection * viewMatrix;
+            m_CullingCS.GetKernelThreadGroupSizes(kKernelCullChunks, out uint groupSize, out _, out _);
+            bool any = false;
+            foreach (var (gs, _) in m_ActiveSplats)
+            {
+                cmb.SetComputeMatrixParam(m_CullingCS, "_S2PCullMatrixVP", viewProj * gs.transform.localToWorldMatrix);
+                cmb.SetComputeBufferParam(m_CullingCS, kKernelCullChunks, "_S2PGpuChunks", gs.GpuChunkBuffer);
+                cmb.SetComputeBufferParam(m_CullingCS, kKernelCullChunks, "_S2PChunkVisibleFlags", gs.GpuChunkFlagsBuffer);
+                cmb.SetComputeBufferParam(m_CullingCS, kKernelCullChunks, "_S2PIndirectArgs", m_IndirectArgs);
+                cmb.SetComputeTextureParam(m_CullingCS, kKernelCullChunks, "_S2PHiZPyramid", m_HiZPyramid);
+                cmb.SetComputeIntParam(m_CullingCS, "_ChunkCount", gs.GpuChunkCount);
+                cmb.SetComputeIntParam(m_CullingCS, "_HiZWidth", kHiZWidth);
+                cmb.SetComputeIntParam(m_CullingCS, "_HiZHeight", kHiZHeight);
+                cmb.DispatchCompute(m_CullingCS, kKernelCullChunks,
+                    (gs.GpuChunkCount + (int)groupSize - 1) / (int)groupSize, 1, 1);
+                any = true;
+            }
+            GpuChunkCullingActive = any;
+        }
+
+        static int CountMips(int w, int h)
+        {
+            int mips = 1;
+            while (w > 1 || h > 1) { w = Mathf.Max(w >> 1, 1); h = Mathf.Max(h >> 1, 1); ++mips; }
+            return mips;
+        }
+
+        void EnsureCullingResources()
+        {
+            if (m_HiZPyramid == null)
+            {
+                var desc = new RenderTextureDescriptor(kHiZWidth, kHiZHeight, GraphicsFormat.R32_SFloat, 0)
+                {
+                    useMipMap = true,
+                    autoGenerateMips = false,
+                    msaaSamples = 1
+                };
+                m_HiZPyramid = new RenderTexture(desc)
+                {
+                    name = "S2P_HiZPyramid",
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                m_HiZPyramid.Create();
+            }
+            if (m_IndirectArgs == null)
+            {
+                // DrawProceduralIndirect 参数布局:(vertexCountPerInstance, instanceCount, startVertex, startInstance)
+                m_IndirectArgs = new ComputeBuffer(1, 16, ComputeBufferType.IndirectArguments)
+                {
+                    name = "S2P_IndirectArgs"
+                };
+                m_IndirectArgs.SetData(new uint[] { 6, 0, 0, 0 });
+            }
+        }
+
         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
         public void CacheViewDataForAllSplats(Camera cam, CommandBuffer cmb, Matrix4x4 projection, Matrix4x4 view, int width, int height)
         {
@@ -334,7 +462,7 @@ namespace GaussianSplatting.Runtime
             m_FrameOffset++;
 
             m_MatSplats.SetInt(GaussianSplatRenderer.Props.SrcBlend, (int)(stochastic ? BlendMode.One : BlendMode.OneMinusDstAlpha));
-            m_MatSplats.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)(stochastic ? BlendMode.Zero : BlendMode.One));
+            m_MatSplats.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)(stochastic ? BlendMode.One : BlendMode.Zero));
             m_MatSplats.SetInt(GaussianSplatRenderer.Props.ZWrite, stochastic ? 1 : 0);
 
             var mpb = m_DrawProperties;
@@ -344,7 +472,18 @@ namespace GaussianSplatting.Runtime
             mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, m_GpuSortKeys);
             mpb.SetConstantBuffer(GaussianSplatRenderer.Props.SplatGlobalUniforms, m_GlobalUniforms, 0, m_GlobalUniforms.stride);
             cmb.BeginSample(s_ProfDraw);
-            cmb.DrawProcedural(m_QuadIndexBuffer, Matrix4x4.identity, m_MatSplats, 0, MeshTopology.Triangles, 6, m_SplatCount, mpb);
+            // M6 T6.3:间接绘制 —— 参数由 CSCullChunks 在 GPU 上精确累加
+            // (升序排序中被剔除 splat 的 0xFFFFFFFF 键排在绘制流末尾,instanceCount=可见数即完整绘制所有可见 splat;
+            //  非排序模式下参数回退为全量实例数,被剔除实例由顶点着色器 NaN 丢弃)
+            if (GpuChunkCullingActive && settings.m_IndirectDraw && m_IndirectArgs != null)
+            {
+                cmb.DrawProceduralIndirect(Matrix4x4.identity, m_MatSplats, 0,
+                    MeshTopology.Triangles, m_IndirectArgs, 1, mpb);
+            }
+            else
+            {
+                cmb.DrawProcedural(m_QuadIndexBuffer, Matrix4x4.identity, m_MatSplats, 0, MeshTopology.Triangles, 6, m_SplatCount, mpb);
+            }
             cmb.EndSample(s_ProfDraw);
         }
 
@@ -491,6 +630,31 @@ namespace GaussianSplatting.Runtime
         public float m_OpacityScale = 1.0f;
         [Range(0, 3)] [Tooltip("Spherical Harmonics order to use")]
         public int m_SHOrder = 3;
+        [Tooltip("M6:加载完成后按 30-bit Morton 码空间重排(相邻高斯显存连续,提升 L2 命中率),并构建分块剔除所需的 Chunk AABB")]
+        public bool m_MortonReorder = true;
+
+        // —— M6 GPU 分块剔除状态 ——
+        internal const int kGpuChunkSize = SplatGpuChunking.kChunkSize;
+        GraphicsBuffer m_GpuChunks;          // SplatGpuChunk × chunkCount(局部 AABB + 起止索引)
+        GraphicsBuffer m_ChunkVisibleFlags;  // uint × chunkCount(CSCullChunks 写入:0=剔除 1=可见)
+        int[] m_ChunkSplatCounts;
+        Bounds[] m_CpuChunkBounds;
+        bool m_FlagsReadbackPending;
+
+        /// <summary>GPU 分块数量(m_MortonReorder 关闭或未加载完成时为 0)。</summary>
+        public int GpuChunkCount => m_CpuChunkBounds != null ? m_CpuChunkBounds.Length : 0;
+        /// <summary>每个分块的局部 AABB(M4 CPU 分块/M6 GPU 分块均可用)。</summary>
+        public Bounds[] CpuChunkBounds => m_CpuChunkBounds;
+        /// <summary>是否处于 GPU 分块剔除激活状态(有分块且选项开启)。</summary>
+        public bool GpuCullingActive =>
+            m_ChunkVisibleFlags != null && GaussianSplatRenderingOptions.instance.m_GpuChunkCulling;
+        /// <summary>最近一次完成的 GPU 剔除可见 Chunk 数(-1 = 尚无数据,延迟一帧)。</summary>
+        public int GpuCullingVisibleChunks { get; private set; } = -1;
+        /// <summary>最近一次完成的 GPU 剔除后参与排序/光栅化的精确 splat 数(-1 = 尚无数据)。</summary>
+        public int GpuCullingVisibleSplats { get; private set; } = -1;
+        internal GraphicsBuffer GpuChunkBuffer => m_GpuChunks;
+        internal GraphicsBuffer GpuChunkFlagsBuffer => m_ChunkVisibleFlags;
+
         int m_SplatCount;
         GraphicsBuffer m_GpuPosData;
         GraphicsBuffer m_GpuOtherData;
@@ -545,6 +709,9 @@ namespace GaussianSplatting.Runtime
             public static readonly int VecScreenParams = Shader.PropertyToID("_VecScreenParams");
             public static readonly int VecWorldSpaceCameraPos = Shader.PropertyToID("_VecWorldSpaceCameraPos");
             public static readonly int CameraTargetTexture = Shader.PropertyToID("_CameraTargetTexture");
+            // M6 GPU 分块剔除
+            public static readonly int S2PUseGpuChunkCull = Shader.PropertyToID("_S2PUseGpuChunkCull");
+            public static readonly int S2PChunkVisibleFlags = Shader.PropertyToID("_S2PChunkVisibleFlags");
         }
 
         public int splatCount => m_SplatCount;
@@ -567,12 +734,95 @@ namespace GaussianSplatting.Runtime
             sourceSHDegree = data.shDegree;
             m_SHCoefficients = data.shCoefficients;
             localBounds = data.bounds;
+            // M6 T6.1:Morton 空间重排 + 分块 AABB 构建(纯双射置换,不改变渲染语义)
+            Bounds[] chunkBounds = m_MortonReorder ? SplatMortonReorder.ReorderAndBuildChunks(data) : null;
             m_GpuPosData = Upload(data.positions, "GaussianPosData");
             m_GpuOtherData = Upload(data.geometry, "GaussianOtherData");
             m_GpuColorData = Upload(data.colors, "GaussianColorData");
             m_GpuSHData = Upload(data.sh, "GaussianSHData");
+            CreateChunkResources(chunkBounds);
             EnsureRegistered();
             GaussianSplatRenderSystem.instance.InvalidateTemporalHistory();
+        }
+
+        /// <summary>M6:上传分块 AABB 与可见性标志缓冲(默认全部可见)。</summary>
+        void CreateChunkResources(Bounds[] chunkBounds)
+        {
+            DisposeChunkResources();
+            if (chunkBounds == null || chunkBounds.Length == 0)
+                return;
+            int chunkCount = chunkBounds.Length;
+            m_CpuChunkBounds = chunkBounds;
+            m_ChunkSplatCounts = new int[chunkCount];
+            var gpuChunks = new NativeArray<SplatGpuChunking.GpuChunk>(chunkCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            try
+            {
+                for (int c = 0; c < chunkCount; ++c)
+                {
+                    int start = c * kGpuChunkSize;
+                    int cnt = Mathf.Min(kGpuChunkSize, m_SplatCount - start);
+                    m_ChunkSplatCounts[c] = cnt;
+                    gpuChunks[c] = new SplatGpuChunking.GpuChunk
+                    {
+                        boundsMin = chunkBounds[c].min,
+                        boundsMax = chunkBounds[c].max,
+                        startSplatIdx = (uint)start,
+                        splatCount = (uint)cnt
+                    };
+                }
+                m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Structured, chunkCount, 32) { name = "GaussianSplatChunks" };
+                m_GpuChunks.SetData(gpuChunks);
+            }
+            finally { if (gpuChunks.IsCreated) gpuChunks.Dispose(); }
+
+            var flags = new NativeArray<uint>(chunkCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            try
+            {
+                for (int i = 0; i < chunkCount; ++i) flags[i] = 1;
+                m_ChunkVisibleFlags = new GraphicsBuffer(GraphicsBuffer.Target.Structured, chunkCount, 4) { name = "GaussianSplatChunkFlags" };
+                m_ChunkVisibleFlags.SetData(flags);
+            }
+            finally { if (flags.IsCreated) flags.Dispose(); }
+        }
+
+        void DisposeChunkResources()
+        {
+            DisposeBuffer(ref m_GpuChunks);
+            DisposeBuffer(ref m_ChunkVisibleFlags);
+            m_CpuChunkBounds = null;
+            m_ChunkSplatCounts = null;
+            GpuCullingVisibleChunks = -1;
+            GpuCullingVisibleSplats = -1;
+        }
+
+        /// <summary>M6:请求分块可见性标志异步读回(延迟一帧的精确可见计数,缓冲极小)。</summary>
+        void RequestChunkFlagsReadback()
+        {
+            if (m_ChunkVisibleFlags == null || m_FlagsReadbackPending)
+                return;
+            if (!GaussianSplatRenderingOptions.instance.m_GpuChunkCulling)
+                return;
+            m_FlagsReadbackPending = true;
+            AsyncGPUReadback.Request(m_ChunkVisibleFlags, OnChunkFlagsReadback);
+        }
+
+        void OnChunkFlagsReadback(AsyncGPUReadbackRequest req)
+        {
+            m_FlagsReadbackPending = false;
+            if (req.hasError || m_ChunkVisibleFlags == null)
+                return;
+            var data = req.GetData<uint>();
+            int chunkCount = m_ChunkSplatCounts != null ? m_ChunkSplatCounts.Length : 0;
+            int visChunks = 0;
+            long visSplats = 0;
+            for (int i = 0; i < data.Length && i < chunkCount; ++i)
+            {
+                if (data[i] == 0) continue;
+                ++visChunks;
+                visSplats += m_ChunkSplatCounts[i];
+            }
+            GpuCullingVisibleChunks = visChunks;
+            GpuCullingVisibleSplats = (int)visSplats;
         }
 
         bool resourcesAreSetUp => GaussianSplatRenderingOptions.instance.resourcesFound;
@@ -670,6 +920,8 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuOtherData);
             DisposeBuffer(ref m_GpuSHData);
 
+            DisposeChunkResources();
+
             m_SplatCount = 0;
         }
 
@@ -718,6 +970,12 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeIntParam(cs, Props.SHOrder, m_SHOrder);
             cmb.SetComputeIntParam(cs, Props.SHOnly, options.m_SHOnly ? 1 : 0);
 
+            // M6 T6.3:分块剔除早退(仅当存在分块且选项开启时,核内才索引标志缓冲)
+            bool chunkCull = GaussianSplatRenderingOptions.instance.m_GpuChunkCulling && m_ChunkVisibleFlags != null;
+            cmb.SetComputeIntParam(cs, Props.S2PUseGpuChunkCull, chunkCull ? 1 : 0);
+            if (chunkCull)
+                cmb.SetComputeBufferParam(cs, kKernelCalcViewData, Props.S2PChunkVisibleFlags, m_ChunkVisibleFlags);
+
             cs.GetKernelThreadGroupSizes(kKernelCalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(cs, kKernelCalcViewData, (m_SplatCount + (int)gsX - 1)/(int)gsX, 1, 1);
         }
@@ -729,6 +987,13 @@ namespace GaussianSplatting.Runtime
             if (!Application.isPlaying) return;
 #endif
             UpdateLoading();
+            UpdateGpuCullingCounters(); // M6:分块可见计数异步读回
+        }
+
+        /// <summary>M6:请求并处理分块可见性计数读回(公开入口,无头验证与性能面板共用)。</summary>
+        public void UpdateGpuCullingCounters()
+        {
+            RequestChunkFlagsReadback();
         }
 
 #if UNITY_EDITOR

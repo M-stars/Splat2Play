@@ -1,0 +1,165 @@
+// Splat2Play — M6(方向 1)T6.2/T6.3:GPU Chunk 级视锥 + Hi-Z 深度遮挡剔除 + 间接绘制参数
+// 管线(每相机每帧):
+//   1. CSHiZMip0       —— 相机深度 → 256×128 Hi-Z mip0(覆盖区取 min;Reversed-Z 下 min = 最远遮挡物)
+//   2. CSHiZDownsample —— 逐级 2×2 min 下采样(Reversed-Z 规则,见规格 §3.2(2))
+//   3. CSResetIndirectArgs —— 重置 DrawProceduralIndirect 参数(6, count, 0, 0)
+//   4. CSCullChunks    —— 每 Chunk:视锥测试 + 屏幕投影 AABB 对应 Mip 深度比较;
+//                         可见 Chunk 累加 splat 数到间接参数,写出可见性标志
+// SPDX-License-Identifier: MIT
+
+#pragma kernel CSHiZMip0
+#pragma kernel CSHiZDownsample
+#pragma kernel CSResetIndirectArgs
+#pragma kernel CSCullChunks
+
+// —— Hi-Z 金字塔构建 ——
+Texture2D<float> _S2PHiZSrcDepth;   // 相机深度(全局,Reversed-Z:近=1 远=0)
+RWTexture2D<float> _HiZDst;         // 目标 mip
+Texture2D<float> _HiZPrev;          // 上一级 mip(下采样源)
+float4 _HiZSrcSize;                 // xy = 源深度尺寸
+float4 _HiZDstSize;                 // xy = 目标 mip 尺寸
+
+[numthreads(8, 8, 1)]
+void CSHiZMip0(uint3 id : SV_DispatchThreadID)
+{
+    uint2 dst = id.xy;
+    if (dst.x >= (uint)_HiZDstSize.x || dst.y >= (uint)_HiZDstSize.y)
+        return;
+    float2 perTexel = _HiZSrcSize.xy / _HiZDstSize.xy;
+    uint x0 = (uint)(dst.x * perTexel.x);
+    uint x1 = min((uint)ceil((dst.x + 1) * perTexel.x), (uint)_HiZSrcSize.x);
+    uint y0 = (uint)(dst.y * perTexel.y);
+    uint y1 = min((uint)ceil((dst.y + 1) * perTexel.y), (uint)_HiZSrcSize.y);
+    float m = 1.0;
+    for (uint y = y0; y < y1; ++y)
+    for (uint x = x0; x < x1; ++x)
+    {
+        float d = _S2PHiZSrcDepth.Load(int3(x, y, 0));
+        // 背景/无穷远统一映射为 0(Reversed-Z 最远),保证天空背景永不产生错误遮挡
+        if (d >= 1.0 - 1e-6)
+            d = 0.0;
+        m = min(m, d);
+    }
+    _HiZDst[dst] = m;
+}
+
+[numthreads(8, 8, 1)]
+void CSHiZDownsample(uint3 id : SV_DispatchThreadID)
+{
+    uint2 dst = id.xy;
+    if (dst.x >= (uint)_HiZDstSize.x || dst.y >= (uint)_HiZDstSize.y)
+        return;
+    // Reversed-Z 2×2 下采样必须取 min(min(d00,d10),min(d01,d11)):
+    // 区域内"最薄弱(最易漏出背景)"的遮挡深度 = 所有像素深度的最小值(规格 §3.2(2))
+    int2 p = int2(dst) * 2;
+    int2 sz = int2(_HiZDstSize.xy) * 2;
+    float d00 = _HiZPrev.Load(int3(p, 0));
+    float d10 = _HiZPrev.Load(int3(min(p + int2(1, 0), sz - 1), 0));
+    float d01 = _HiZPrev.Load(int3(min(p + int2(0, 1), sz - 1), 0));
+    float d11 = _HiZPrev.Load(int3(min(p + int2(1, 1), sz - 1), 0));
+    _HiZDst[dst] = min(min(d00, d10), min(d01, d11));
+}
+
+// —— 分块剔除 ——
+struct SplatGpuChunk
+{
+    float3 boundsMin;
+    uint   startSplatIdx;
+    float3 boundsMax;
+    uint   splatCount;
+};
+
+StructuredBuffer<SplatGpuChunk> _S2PGpuChunks;
+RWStructuredBuffer<uint> _S2PChunkVisibleFlags;
+RWStructuredBuffer<uint> _S2PIndirectArgs;   // DrawProceduralIndirect: [0]=6 [1]=instanceCount
+Texture2D<float> _S2PHiZPyramid;             // 已构建的 Hi-Z(含 mip 链)
+float4x4 _S2PCullMatrixVP;                   // projection * view * objectToWorld(局部 → 裁剪)
+uint _ChunkCount;
+uint _HiZWidth;
+uint _HiZHeight;
+
+[numthreads(1, 1, 1)]
+void CSResetIndirectArgs()
+{
+    _S2PIndirectArgs[0] = 6u;
+    // 排序模式:0 → CSCullChunks 用 InterlockedAdd 累加真实可见数(剔除 splat 排到绘制流末尾);
+    // 非排序模式(Stochastic):回退为全量实例数(中间被剔除的实例由顶点 NaN 丢弃)
+    _S2PIndirectArgs[1] = _S2PArgsUseVisibleCount != 0 ? 0u : _S2PTotalSplatCount;
+}
+
+[numthreads(64, 1, 1)]
+void CSCullChunks(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= _ChunkCount)
+        return;
+
+    SplatGpuChunk chunk = _S2PGpuChunks[c];
+
+#if UNITY_REVERSED_Z
+    // 8 角点 → 裁剪空间(局部 AABB 直接经组合矩阵变换)
+    float3 mn = chunk.boundsMin, mx = chunk.boundsMax;
+    float minNdcX = 1e9, maxNdcX = -1e9;
+    float minNdcY = 1e9, maxNdcY = -1e9;
+    float minNdcZ = 1e9, maxNdcZ = -1e9;
+    bool anyInFront = false;
+    [unroll]
+    for (int i = 0; i < 8; ++i)
+    {
+        float3 corner = float3(i & 1 ? mx.x : mn.x, i & 2 ? mx.y : mn.y, i & 4 ? mx.z : mn.z);
+        float4 clip = mul(_S2PCullMatrixVP, float4(corner, 1.0));
+        if (clip.w > 1e-6)
+        {
+            float3 ndc = clip.xyz / clip.w;
+            minNdcX = min(minNdcX, ndc.x); maxNdcX = max(maxNdcX, ndc.x);
+            minNdcY = min(minNdcY, ndc.y); maxNdcY = max(maxNdcY, ndc.y);
+            minNdcZ = min(minNdcZ, ndc.z); maxNdcZ = max(maxNdcZ, ndc.z);
+            anyInFront = true;
+        }
+    }
+
+    uint visible = 1;
+    if (!anyInFront)
+        visible = 0;    // 完全在相机后方
+    else if (maxNdcX < -1.0 || minNdcX > 1.0 || maxNdcY < -1.0 || minNdcY > 1.0 || maxNdcZ < 0.0)
+        visible = 0;    // 视锥外(投影包围盒测试,保守)
+    else
+    {
+        // 屏幕投影 UV 包围盒
+        float2 uvMin = saturate(float2(minNdcX, minNdcY) * 0.5 + 0.5);
+        float2 uvMax = saturate(float2(maxNdcX, maxNdcY) * 0.5 + 0.5);
+        // 对应 Mip 层级:mip = ceil(log2(max(像素宽, 像素高)))
+        float pxW = max((uvMax.x - uvMin.x) * _HiZWidth, 1.0);
+        float pxH = max((uvMax.y - uvMin.y) * _HiZHeight, 1.0);
+        uint mip = (uint)ceil(log2(max(pxW, pxH)));
+        // 本纹理 256×128 → mip 链 0..8(共 9 级,与 C# CountMips 一致)
+        uint mipCount = 1;
+        uint tw = _HiZWidth, th = _HiZHeight;
+        while (tw > 1 || th > 1) { tw = max(tw >> 1, 1u); th = max(th >> 1, 1u); ++mipCount; }
+        mip = min(mip, mipCount - 1);
+        float2 mipSize = float2(_HiZWidth, _HiZHeight) * exp2(-mip);
+        int2 tMin = int2(floor(uvMin * mipSize)) - 1;
+        int2 tMax = int2(floor(uvMax * mipSize));
+        float occluder = 1.0;
+        [unroll]
+        for (int ty = 0; ty < 2; ++ty)
+        for (int tx = 0; tx < 2; ++tx)
+        {
+            int2 tc = int2(tx ? tMax.x : tMin.x, ty ? tMax.y : tMin.y);
+            tc = clamp(tc, int2(0, 0), int2(mipSize) - 1);
+            occluder = min(occluder, _S2PHiZPyramid.Load(int4(tc, mip, 0)));
+        }
+        // Chunk 最近点(Reversed-Z 下 = 角点最大 z_ndc)仍比遮挡物最薄弱处更远 → 100% 被遮挡
+        float zChunkNear = maxNdcZ;
+        if (zChunkNear < occluder - 1e-4)
+            visible = 0;
+    }
+    _S2PChunkVisibleFlags[c] = visible;
+    if (visible != 0)
+        InterlockedAdd(_S2PIndirectArgs[1], chunk.splatCount);
+#else
+    // 非 Reversed-Z 平台:保持全部可见(保守,无剔除)
+    _S2PChunkVisibleFlags[c] = 1;
+    InterlockedAdd(_S2PIndirectArgs[1], chunk.splatCount);
+#endif
+}

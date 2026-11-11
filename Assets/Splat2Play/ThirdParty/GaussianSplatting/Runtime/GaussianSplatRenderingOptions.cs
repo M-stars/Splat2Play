@@ -62,6 +62,12 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Show only Spherical Harmonics contribution, using gray color")]
         public bool m_SHOnly;
 
+        [Header("S2P M6 GPU Culling")]
+        [Tooltip("GPU 分块剔除:视锥 + Hi-Z 深度遮挡(Morton 分块,需 m_MortonReorder 开启)")]
+        public bool m_GpuChunkCulling = true;
+        [Tooltip("剔除后通过 DrawProceduralIndirect 只绘制可见实例(排序模式下精确跳过被剔除 splat)")]
+        public bool m_IndirectDraw = true;
+
         internal StochasticTemporalFilter temporalFilter => m_Transparency == TransparencyMode.Stochastic && m_RenderMode == RenderMode.Splats
             ? m_TemporalFilter : StochasticTemporalFilter.None;
 

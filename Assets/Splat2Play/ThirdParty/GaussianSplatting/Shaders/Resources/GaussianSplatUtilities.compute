@@ -52,66 +52,10 @@ float _SplatOpacityScale;
 uint _SHOrder;
 uint _SHOnly;
 
-void DecomposeCovariance(float3 cov2d, out float2 v1, out float2 v2)
-{
-    #if 0 // does not quite give the correct results?
-
-    // https://jsfiddle.net/mattrossman/ehxmtgw6/
-    // References:
-    // - https://www.youtube.com/watch?v=e50Bj7jn9IQ
-    // - https://en.wikipedia.org/wiki/Eigenvalue_algorithm#2%C3%972_matrices
-    // - https://people.math.harvard.edu/~knill/teaching/math21b2004/exhibits/2dmatrices/index.html
-    float a = cov2d.x;
-    float b = cov2d.y;
-    float d = cov2d.z;
-    float det = a * d - b * b; // matrix is symmetric, so "c" is same as "b"
-    float trace = a + d;
-
-    float mean = 0.5 * trace;
-    float dist = sqrt(mean * mean - det);
-
-    float lambda1 = mean + dist; // 1st eigenvalue
-    float lambda2 = mean - dist; // 2nd eigenvalue
-
-    if (b == 0) {
-        // https://twitter.com/the_ross_man/status/1706342719776551360
-        if (a > d) v1 = float2(1, 0);
-        else v1 = float2(0, 1);
-    } else
-        v1 = normalize(float2(b, d - lambda2));
-
-    v1.y = -v1.y;
-    // The 2nd eigenvector is just a 90 degree rotation of the first since Gaussian axes are orthogonal
-    v2 = float2(v1.y, -v1.x);
-
-    // scaling components
-    v1 *= sqrt(lambda1);
-    v2 *= sqrt(lambda2);
-
-    float radius = 1.5;
-    v1 *= radius;
-    v2 *= radius;
-
-    #else
-
-    // same as in antimatter15/splat
-    float diag1 = cov2d.x, diag2 = cov2d.z, offDiag = cov2d.y;
-    float mid = 0.5f * (diag1 + diag2);
-    float radius = length(float2((diag1 - diag2) / 2.0, offDiag));
-    float lambda1 = mid + radius;
-    float lambda2 = max(mid - radius, 0.1);
-
-    // diagonal covariance already has axis-aligned eigenvectors, avoid normalizing (0,0)
-    float2 diagVec = offDiag == 0
-        ? (diag1 >= diag2 ? float2(1, 0) : float2(0, 1))
-        : normalize(float2(offDiag, lambda1 - diag1));
-    diagVec.y = -diagVec.y;
-    float maxSize = 4096.0;
-    v1 = min(sqrt(2.0 * lambda1), maxSize) * diagVec;
-    v2 = min(sqrt(2.0 * lambda2), maxSize) * float2(diagVec.y, -diagVec.x);
-
-    #endif
-}
+// —— S2P M6:GPU 分块剔除(视锥 + Hi-Z)——
+// 仅当 _S2PUseGpuChunkCull != 0 时才允许访问 _S2PChunkVisibleFlags(该缓冲由 C# 保证此时已绑定)
+RWStructuredBuffer<uint> _S2PChunkVisibleFlags;
+uint _S2PUseGpuChunkCull;
 
 [numthreads(GROUP_SIZE,1,1)]
 void CSCalcViewData (uint3 id : SV_DispatchThreadID)
@@ -119,6 +63,26 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     uint idx = id.x;
     if (idx >= _SplatCount)
         return;
+
+    // —— S2P M6 T6.3:所属 Chunk 被剔除 → 直接早退,跳过协方差矩阵/特征分解/球谐求值 ——
+    if (_S2PUseGpuChunkCull != 0)
+    {
+        uint chunkIdx = idx >> 12; // 4096 splats per chunk
+        if (_S2PChunkVisibleFlags[chunkIdx] == 0)
+        {
+            SplatViewData culledView = (SplatViewData)0;
+            culledView.pos.x = asfloat(0x7f800000u); // NaN,顶点着色器自动丢弃退化三角形
+            _SplatViewData[_SplatOffset + idx] = culledView;
+            if (_WriteSortKeys != 0)
+            {
+                // 升序排序(Far→Near)中 0xFFFFFFFF 为最大键 → 排到绘制流末尾,
+                // 使 DrawProceduralIndirect 以 instanceCount=可见数 即可精确跳过
+                _SplatSortDistances[_SplatOffset + idx] = 0xFFFFFFFFu;
+                _SplatSortKeys[_SplatOffset + idx] = _SplatOffset + idx;
+            }
+            return;
+        }
+    }
 
     SplatData splat = LoadSplatGeometry(idx);
     SplatViewData view = (SplatViewData)0;
@@ -166,11 +130,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
             half4 col;
             col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
             col.a = min(splat.opacity * opacityScale, 65000);
-            view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
-            view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
-        }
-    }
-    
+
     uint outputIndex = _SplatOffset + idx;
     _SplatViewData[outputIndex] = view;
     if (_WriteSortKeys != 0)

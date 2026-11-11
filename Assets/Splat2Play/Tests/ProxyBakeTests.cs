@@ -700,5 +700,85 @@ namespace Splat2Play.Tests
             }
         }
 
+        // ==================== M6(方向 1):Morton 空间重排与分块 ====================
+
+        [Test]
+        public void MortonReorder_PreservesAllSplatsAndBuildsValidChunkBounds()
+        {
+            int count = 9000; // 覆盖 ceil(9000/4096)=3 个分块
+            using var data = new GaussianSplatting.Runtime.GaussianSplatData(count, 1);
+            var rng = new System.Random(424242);
+            var origPos = new float3[count];
+            float3 mn = new float3(float.PositiveInfinity), mx = new float3(float.NegativeInfinity);
+            for (int i = 0; i < count; ++i)
+            {
+                // 少量重复位置(相同 Morton 键)以覆盖稳定排序路径
+                float3 p = i % 97 == 0 ? new float3(7.5f, -3f, 12f)
+                    : new float3((float)rng.NextDouble() * 100f - 50f, (float)rng.NextDouble() * 20f - 10f, (float)rng.NextDouble() * 60f - 30f);
+                origPos[i] = p;
+                mn = math.min(mn, p); mx = math.max(mx, p);
+                data.positions[i * 3 + 0] = math.asuint(p.x);
+                data.positions[i * 3 + 1] = math.asuint(p.y);
+                data.positions[i * 3 + 2] = math.asuint(p.z);
+                // geometry:由身份索引派生,验证置换一致性
+                data.geometry[i * 3 + 0] = (uint)(i * 7 + 1);
+                data.geometry[i * 3 + 1] = (uint)(i * 7 + 2);
+                data.geometry[i * 3 + 2] = (uint)(i * 7 + 3);
+                data.colors[i] = (uint)i; // colors 直接编码原始身份 → 双射验证的锚点
+                data.sh[i * 2 + 0] = (uint)(i * 31 + 1);
+                data.sh[i * 2 + 1] = (uint)(i * 31 + 2);
+            }
+            data.bounds.SetMinMax(mn, mx);
+
+            var chunks = GaussianSplatting.Runtime.SplatMortonReorder.ReorderAndBuildChunks(data);
+            {
+                Assert.IsNotNull(chunks, "应构建分块 AABB");
+                Assert.AreEqual((count + 4095) / 4096, chunks.Length, "分块数量应为 ceil(count/4096)");
+
+                // 1) 双射:colors 编码的身份 0..count-1 每个恰好出现一次,且其余数组同步置换
+                var seen = new bool[count];
+                for (int k = 0; k < count; ++k)
+                {
+                    int orig = (int)data.colors[k];
+                    Assert.That(orig, Is.InRange(0, count - 1), $"置换后身份越界: {orig}");
+                    Assert.IsFalse(seen[orig], $"身份 {orig} 出现多次(非双射)");
+                    seen[orig] = true;
+                    Assert.That(data.positions[k * 3], Is.EqualTo(math.asuint(origPos[orig].x)), "positions 置换不一致");
+                    Assert.That(data.positions[k * 3 + 1], Is.EqualTo(math.asuint(origPos[orig].y)), "positions 置换不一致");
+                    Assert.That(data.positions[k * 3 + 2], Is.EqualTo(math.asuint(origPos[orig].z)), "positions 置换不一致");
+                    Assert.That(data.geometry[k * 3 + 0], Is.EqualTo((uint)(orig * 7 + 1)), "geometry 置换不一致");
+                    Assert.That(data.geometry[k * 3 + 1], Is.EqualTo((uint)(orig * 7 + 2)), "geometry 置换不一致");
+                    Assert.That(data.geometry[k * 3 + 2], Is.EqualTo((uint)(orig * 7 + 3)), "geometry 置换不一致");
+                    Assert.That(data.sh[k * 2 + 0], Is.EqualTo((uint)(orig * 31 + 1)), "sh 置换不一致");
+                    Assert.That(data.sh[k * 2 + 1], Is.EqualTo((uint)(orig * 31 + 2)), "sh 置换不一致");
+                }
+
+                // 2) Morton 键单调不降(重排目的:空间相邻 → 键有序)
+                float3 newMin = data.bounds.min, newSpan = math.max(data.bounds.size, new float3(1e-6f));
+                uint prevKey = 0;
+                for (int k = 0; k < count; ++k)
+                {
+                    float3 p = new float3(math.asfloat(data.positions[k * 3]), math.asfloat(data.positions[k * 3 + 1]), math.asfloat(data.positions[k * 3 + 2]));
+                    uint key = GaussianSplatting.Runtime.SplatMorton.Morton3D((p - newMin) / newSpan);
+                    Assert.GreaterOrEqual(key, prevKey, $"Morton 键在 {k} 处未保持有序");
+                    prevKey = key;
+                }
+
+                // 3) 每个 Chunk 的 AABB 严格包含其内部全部 splat
+                for (int c = 0; c < chunks.Length; ++c)
+                {
+                    int lo = c * 4096, hi = math.min(lo + 4096, count);
+                    Assert.Greater(hi, lo, $"分块 {c} 为空");
+                    for (int k = lo; k < hi; ++k)
+                    {
+                        float3 p = new float3(math.asfloat(data.positions[k * 3]), math.asfloat(data.positions[k * 3 + 1]), math.asfloat(data.positions[k * 3 + 2]));
+                        Assert.That(p.x, Is.InRange(chunks[c].min.x - 1e-3f, chunks[c].max.x + 1e-3f), $"splat {k} 超出分块 {c} AABB(X)");
+                        Assert.That(p.y, Is.InRange(chunks[c].min.y - 1e-3f, chunks[c].max.y + 1e-3f), $"splat {k} 超出分块 {c} AABB(Y)");
+                        Assert.That(p.z, Is.InRange(chunks[c].min.z - 1e-3f, chunks[c].max.z + 1e-3f), $"splat {k} 超出分块 {c} AABB(Z)");
+                    }
+                }
+            }
+        }
+
     }
 }

@@ -8,7 +8,9 @@ namespace GaussianSplatting.Runtime
 {
     // CPU side buffers for uploading the splat data to the GPU.
     // Disposed after the upload.
-    sealed class GaussianSplatData : IDisposable
+    // M6:改为 public —— SplatMortonReorder.ReorderAndBuildChunks(公开重排 API)与
+    // Splat2Play 单元测试需要直接构造/检查该数据结构。
+    public sealed class GaussianSplatData : IDisposable
     {
         public readonly int count, shDegree, shCoefficients;
         public NativeArray<uint> positions, geometry, colors, sh;

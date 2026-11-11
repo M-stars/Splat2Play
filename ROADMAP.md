@@ -49,6 +49,14 @@
 - `ProxyBakeBackend`(Auto / CPUJobsDeterministic / GPUCompute):Auto 在 256³/512³ 且 ≥100 万点时自动走 GPU;烘焙向导支持 `ply,spz` 双后缀
 - **退出标准:** SPZ 解码物理量误差 <1e-3;GPU/CPU 体素密度结构一致(阈值掩码与 SurfaceNets 顶点/面数完全一致)✅(单元测试 12 项全绿,含真实资产基准)
 
+### M6 — GPU 逐块剔除(Frustum+Hi-Z)与间接排序绘制(方向 1)✅ 2026-11-12
+
+- 加载完成即按 30-bit Morton 码重排四数组(稳定基数排序,双射置换),4096/chunk 构建 GPU AABB(`SplatGpuChunk`)
+- `S2PGpuCulling.compute`:相机深度 → 256×128 Hi-Z 金字塔(Reversed-Z 取 Min)→ `CSCullChunks` 视锥 + 遮挡测试
+- `CSCalcViewData` 分块早退(被剔除 splat 写 NaN + `0xFFFFFFFF` 排序键,跳过协方差/特征分解/SH 求值)
+- `DrawProceduralIndirect`:GPU 侧 `InterlockedAdd` 精确累加可见实例数,仅绘制可见 splat;性能面板显示 GPU 剔除精确计数
+- **退出标准:** Morton 重排双射无丢失 + Chunk AABB 包含性 + 键有序 ✅(单元测试);运行时墙面视角可见 Chunk 下降(性能面板验证)
+
 ## 性能基准目标(桌面,RTX 级显卡)
 
 - ≥100 万 splat 场景,开启代理 + 近似光照后仍达 60fps

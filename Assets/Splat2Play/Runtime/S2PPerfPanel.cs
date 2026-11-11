@@ -96,6 +96,20 @@ namespace Splat2Play.Runtime
             _sourceSplats = Proxy != null && Proxy.SourceSplatCount > 0 ? Proxy.SourceSplatCount : activeCount;
             _visibleSplats = activeCount;
 
+            // M6:GPU 分块剔除的精确可见计数(异步读回,延迟一帧)
+            string gpuCullStr = "";
+            if (SplatRenderer != null && SplatRenderer.GpuCullingActive)
+            {
+                int vis = SplatRenderer.GpuCullingVisibleSplats;
+                if (vis >= 0)
+                {
+                    _visibleSplats = vis; // 真实的 GPU 剔除后参与排序/光栅化的精确 splat 数
+                    gpuCullStr = SplatRenderer.GpuCullingVisibleChunks >= 0
+                        ? $" [GPU块 {SplatRenderer.GpuCullingVisibleChunks}/{SplatRenderer.GpuChunkCount}]"
+                        : "";
+                }
+            }
+
             string streaming = "关闭";
             if (TryGetComponent<S2PSplatStreaming>(out var st) && st.enabled)
             {
@@ -110,7 +124,7 @@ namespace Splat2Play.Runtime
             _vramMb = activeCount * 88f / (1024f * 1024f);
 
             string splat = activeCount > 0
-                ? $"{_visibleSplats:N0} / {_sourceSplats:N0}"
+                ? $"{_visibleSplats:N0} / {_sourceSplats:N0}{gpuCullStr}"
                 : $"0 / {_sourceSplats:N0} (已卸载/剔除)";
             string sh = SplatRenderer != null ? $"SH{SplatRenderer.m_SHOrder}" : "-";
             int navTris = Proxy != null && Proxy.NavigationMesh != null ? Proxy.NavigationMesh.triangles.Length / 3 : 0;
