@@ -14,7 +14,9 @@ using System.IO;
 using GaussianSplatting.Runtime;
 using Splat2Play.Runtime;
 using UnityEditor;
+using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Rendering;
 using Debug = UnityEngine.Debug;
 
 namespace Splat2Play.Editor
@@ -80,9 +82,14 @@ namespace Splat2Play.Editor
                 GaussianSplatRenderingOptions.instance.m_IndirectDraw = true;
 
                 float nb1 = CapturePng(cam, Path.Combine(OutDir, "m6_cull_far.png"));
-                renderer.UpdateGpuCullingCounters(); // 泵一次读回
+                // 计数读回:第一次请求在 flags 写入前入队(读到旧值/无值),渲染一帧后重新请求并同步等待
+                renderer.UpdateGpuCullingCounters();
+                CapturePng(cam, Path.Combine(OutDir, "m6_cull_far_pump.png"));
+                AsyncGPUReadback.WaitAllRequests();
+                renderer.UpdateGpuCullingCounters();
+                AsyncGPUReadback.WaitAllRequests();
                 int visSplats = renderer.GpuCullingVisibleSplats;
-                log.AppendLine($"[M6] GPU 剔除后可见 splat 计数(延迟一帧):{visSplats:N0} / {renderer.splatCount:N0}, 可见 Chunk {renderer.GpuCullingVisibleChunks}/{chunks}");
+                log.AppendLine($"[M6] GPU 剔除后可见 splat 计数:{visSplats:N0} / {renderer.splatCount:N0}, 可见 Chunk {renderer.GpuCullingVisibleChunks}/{chunks}");
                 log.AppendLine($"[M6] 远景渲染非黑像素 {nb1:P1}(剔除开启下画面应完整)→ m6_cull_far.png");
                 if (nb1 < 0.5) throw new Exception($"剔除开启时远景画面异常(非黑 {nb1:P1})");
                 if (visSplats >= 0 && visSplats < renderer.splatCount * 0.05)
@@ -94,6 +101,16 @@ namespace Splat2Play.Editor
                 float nb2 = CapturePng(cam, Path.Combine(OutDir, "m6_cull_inside.png"));
                 log.AppendLine($"[M6] 室内视角非黑像素 {nb2:P1} → m6_cull_inside.png");
                 if (nb2 < 0.5) throw new Exception($"室内视角画面异常(非黑 {nb2:P1})——Hi-Z 误剔除");
+                // 剔除正向用例:室内视角下相机后方 Chunk 应被视锥剔除 → 可见数 < 总数
+                renderer.UpdateGpuCullingCounters();
+                CapturePng(cam, Path.Combine(OutDir, "m6_cull_inside_pump.png"));
+                AsyncGPUReadback.WaitAllRequests();
+                renderer.UpdateGpuCullingCounters();
+                AsyncGPUReadback.WaitAllRequests();
+                log.AppendLine($"[M6] 室内视角剔除后可见:{renderer.GpuCullingVisibleSplats:N0} / {renderer.splatCount:N0}, Chunk {renderer.GpuCullingVisibleChunks}/{chunks}"
+                    + (renderer.GpuCullingVisibleChunks is > 0 && renderer.GpuCullingVisibleChunks < chunks
+                        ? " ← 视锥剔除生效(相机后方 Chunk 被剔除)"
+                        : " ← 该视角未产生视锥剔除"));
 
                 // 3. M7:3 盏彩色点光源 + 手电筒,逐高斯重光照
                 var lightColors = new[] { new Color(1f, 0.3f, 0.2f), new Color(0.2f, 0.6f, 1f), new Color(0.3f, 1f, 0.4f) };
@@ -132,9 +149,15 @@ namespace Splat2Play.Editor
                 settings.UseSDF = false;
                 settings.BoundsPercentile = 0f;
                 settings.BoundsMargin = 0.05f;
-                var volume = new Bounds(
-                    new Vector3(b.center.x, b.min.y + b.size.y * 0.2f, b.center.z),
-                    new Vector3(b.size.x * 0.18f, b.size.y * 0.35f, b.size.z * 0.18f));
+                var splats = SplatSourceReader.ReadAllX(PlyPath, out int splatCount, out _, out _);
+                // 切割盒定位:取 splat 中心采样的中位数(原始 bounds 可能被离群点拉偏,
+                // 固定中心常落在空腔);盒体 1.2m³ 保证覆盖物件级 splat 聚簇
+                var sample = new System.Collections.Generic.List<float3>();
+                for (int i = 0; i < splats.Length; i += 997)
+                    sample.Add(splats[i].Position);
+                sample.Sort((a, c) => a.x.CompareTo(c.x));
+                float3 medianPos = sample[sample.Count / 2];
+                var volume = new Bounds((Vector3)medianPos, new Vector3(1.2f, 1.2f, 1.2f));
                 settings.DynamicProps.Add(new ProxyBakeSettings.DynamicPropVolume
                 {
                     PropName = "SmokeProp",
@@ -142,7 +165,6 @@ namespace Splat2Play.Editor
                     Mass = 6f,
                     Destructible = false
                 });
-                var splats = SplatSourceReader.ReadAllX(PlyPath, out int splatCount, out _, out _);
                 string propPath;
                 int propSplats;
                 try

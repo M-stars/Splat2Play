@@ -50,3 +50,24 @@
 - 256³ 体素化+SDF 端到端 **139 ms(< 150ms 目标 ✓)**;纯 GPU 派发 36 ms
 - 512³ 纯 GPU 派发 67 ms;端到端 758 ms 由 512MB 密度场 PCIe 读回主导(CPU 共享的 Fill/SurfaceNets 阶段不变)
 - GPU 后端三角面与 CPU 略有差异(76,053 vs 76,143):GPU 路径 SDF 在填充前执行(§2.2 规格 GPU 流程),结构一致性由单元测试(UseSDF=false 下掩码/网格完全一致)保证
+
+## M6/M7/M8 无头运行时验证(2026-11-12,scene_bonsai 1,244,819 splats,`SplatM678Verify.Run`)
+
+| 模块 | 验证项 | 实测结果 |
+|---|---|---|
+| M6 | Morton 分块 | 304 chunks = ceil(1244819/4096) ✓ |
+| M6 | GPU 剔除开启下远景/室内渲染 | 非黑像素均 **100.0%**(无破洞/误剔除)✓ |
+| M6 | 可见计数读回 | 1,244,819/1,244,819(相机嵌入单体点云内,全部分块几何上保守可见;剔除收益需多区块/墙体遮挡场景,与 M4 9 点射线剔除互补)|
+| M7 | 3 盏彩色点光源 + 手电筒(逐高斯路径) | 非黑像素 100.0%,画面完整 ✓ |
+| M8 | 真实扫描动态物体分离 | 物体 2,826 splats / 背景 1,242,249 splats(含底面修补)✓ |
+| M8 | 凸包碰撞装配 | 64³ 烘焙 2,177 面 + `MeshCollider(convex)` + `Rigidbody(mass=6)` + `NavMeshObstacle(carving)` ✓ |
+
+截图:`m6_cull_far.png` / `m6_cull_inside.png` / `m7_dynamic_lights.png`(smoke_out)。
+
+### 验证期间发现并修复的问题
+
+- `S2PGpuCulling.compute` 缺少 `_S2PTotalSplatCount` / `_S2PArgsUseVisibleCount` uniform 声明
+  → CSCullChunks 编译失败 → 间接绘制 instanceCount=0(画面全黑);已修复
+- `S2PVoxelize.compute` CSClearGrid 清零内核的循环覆盖范围错误(每线程自全局 id 扫至缓冲区末尾,
+  写放大 4096 倍,512³ 达 4.3 万亿次存储 → D3D12 设备移除);修正为组内 4096 范围后
+  256³ GPU 体素化+SDF 从 405ms 降至 **107ms**;密度场改用 RWByteAddressBuffer(Raw)承载 512MB

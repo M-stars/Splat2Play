@@ -77,6 +77,8 @@ float4x4 _S2PCullMatrixVP;                   // projection * view * objectToWorl
 uint _ChunkCount;
 uint _HiZWidth;
 uint _HiZHeight;
+uint _S2PTotalSplatCount;                    // 非排序模式的回退实例数
+uint _S2PArgsUseVisibleCount;                // 1 = 排序模式,由 CSCullChunks 累加可见数
 
 [numthreads(1, 1, 1)]
 void CSResetIndirectArgs()
