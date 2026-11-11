@@ -2,7 +2,7 @@
 
 > **扫描现实,即刻可玩。** —— 把真实世界的 3D 高斯泼溅(3DGS)扫描,变成 Unity 里可玩的关卡。
 
-**状态:** 🚧 设计阶段,代码自 M0 起逐步落地(见 [ROADMAP.md](ROADMAP.md) 与 [docs/项目书.md](docs/项目书.md))
+**状态:** ✅ M0–M4 核心工具链已落地并通过实测验证(见 [ROADMAP.md](ROADMAP.md)、[docs/benchmarks.md](docs/benchmarks.md)、[docs/blog-draft.md](docs/blog-draft.md) 与 [docs/项目书.md](docs/项目书.md))
 
 ## 为什么做这个
 

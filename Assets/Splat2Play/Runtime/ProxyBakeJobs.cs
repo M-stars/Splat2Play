@@ -164,7 +164,7 @@ namespace Splat2Play.Runtime
 
     /// <summary>
     /// T1.3 二值化 + 洪泛填充 + 封闭区(单线程 IJob,确定性)。
-    /// 从边界空气体素 BFS 标记 outside(复用最高位);未标记的"空气"即封闭腔体 → 置实心。
+    /// 从边界空气体素 DFS/BFS 标记 outside(复用最高位);未标记的"空气"即封闭腔体 → 置实心。
     /// 封闭区(SealVolumes)在填充前强制置实心。
     /// </summary>
     [BurstCompile(FloatMode = FloatMode.Fast)]
@@ -172,6 +172,7 @@ namespace Splat2Play.Runtime
     {
         public VoxelGridInfo Grid;
         public int ThresholdQ16;
+        public bool SkipInteriorFill;
         [ReadOnly] public NativeArray<AabbRange> SealVolumes;
         public NativeArray<int> DensityQ16; // 最高位复用为 outside 标记(输出保留该位)
         public NativeArray<long> Stats;     // [0]=密度和 [1]=实心体素数(诊断用,NativeContainer 才能跨 Schedule 带回)
@@ -195,7 +196,20 @@ namespace Splat2Play.Runtime
                     DensityQ16[Grid.Index(x, y, z)] = 65536;
             }
 
-            // BFS:从边界空气体素扩散
+            if (SkipInteriorFill)
+            {
+                long sumOnly = 0, solidOnly = 0;
+                for (int i = 0; i < count; ++i)
+                {
+                    int d = DensityQ16[i] & 0x7FFFFFFF;
+                    sumOnly += d;
+                    if (d >= ThresholdQ16) ++solidOnly;
+                }
+                if (Stats.IsCreated) { Stats[0] = sumOnly; Stats[1] = solidOnly; }
+                return;
+            }
+
+            // 连通扩散:从边界空气体素用显式栈遍历标记外部空间
             var queue = new NativeList<int>(1 << 16, Allocator.Temp);
             try
             {
@@ -351,7 +365,7 @@ namespace Splat2Play.Runtime
             }
         }
 
-        float Field(int idx) => DensityQ16[idx] & 0x7FFFFFFF; // 忽略 outside 位
+        float Field(int idx) => (DensityQ16[idx] & 0x7FFFFFFF) * (1f / 65536f); // 忽略 outside 位并归一化到浮点密度
 
         static void Edge(float a, float b, float3 pa, float3 pb, float thr, ref float3 sum, ref int crossings)
         {
@@ -508,16 +522,5 @@ namespace Splat2Play.Runtime
                 if (keys.IsCreated) keys.Dispose();
             }
         }
-        static void SortInts(NativeArray<int> a, int n)
-        {
-            for (int i = 1; i < n; ++i)
-            {
-                int v = a[i];
-                int j = i - 1;
-                while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; --j; }
-                a[j + 1] = v;
-            }
-        }
-
     }
 }

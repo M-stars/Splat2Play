@@ -206,6 +206,24 @@ namespace Splat2Play.Tests
         }
 
         [Test]
+        public void Fill_SkipInteriorFill_PreservesHollowCavity()
+        {
+            var grid = new VoxelGridInfo { N = 16, Min = new float3(-8f), Step = 1f };
+            using var density = PaintHollowBox(grid, 5, 6, 65536);
+            using var seals = new NativeArray<AabbRange>(0, Allocator.TempJob);
+            using var stats = new NativeArray<long>(2, Allocator.TempJob, NativeArrayOptions.ClearMemory);
+
+            new FillJob
+            {
+                Grid = grid, ThresholdQ16 = 32768, SkipInteriorFill = true,
+                SealVolumes = seals, DensityQ16 = density, Stats = stats
+            }.Schedule().Complete();
+
+            int inside = density[grid.Index(8, 8, 8)] & 0x7FFFFFFF;
+            Assert.AreEqual(0, inside, "关闭 FillInterior 时封闭腔体应保持为空");
+        }
+
+        [Test]
         public void Fill_SealVolume_ForcesSolid()
         {
             var grid = new VoxelGridInfo { N = 16, Min = new float3(-8f), Step = 1f };

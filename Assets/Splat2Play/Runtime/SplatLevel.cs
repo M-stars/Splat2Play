@@ -3,11 +3,12 @@
 
 using GaussianSplatting.Runtime;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Splat2Play.Runtime
 {
     /// <summary>
-    /// 挂在关卡根节点:负责按 ProxyData 装配碰撞层(网格碰撞体 + 补丁盒体)。
+    /// 挂在关卡根节点:负责按 ProxyData 装配碰撞层(网格碰撞体 + 补丁盒体 + 可选近似阴影投射)。
     /// 场景结构约定:
     ///   SplatLevel (本组件)
     ///   ├── GaussianSplatRenderer (m_SourcePath 指向 StreamingAssets 下的扫描文件)
@@ -26,6 +27,9 @@ namespace Splat2Play.Runtime
         [Tooltip("碰撞层是否可见调试网格")]
         public bool ShowCollisionDebug;
 
+        [Tooltip("M3:代理网格是否以 ShadowsOnly 模式投射近似动态阴影")]
+        public bool CastApproximateShadows = true;
+
         const string kCollisionChild = "S2P_Collision";
 
         /// <summary>按 ProxyData 装配/重建碰撞子节点。编辑器与运行时均可调用。</summary>
@@ -38,7 +42,11 @@ namespace Splat2Play.Runtime
             }
 
             var old = transform.Find(kCollisionChild);
-            if (old != null) DestroyImmediate(old.gameObject);
+            if (old != null)
+            {
+                if (Application.isPlaying) Destroy(old.gameObject);
+                else DestroyImmediate(old.gameObject);
+            }
 
             var collisionGo = new GameObject(kCollisionChild);
             collisionGo.transform.SetParent(transform, false);
@@ -59,13 +67,27 @@ namespace Splat2Play.Runtime
                 box.size = patch.Size;
             }
 
-            if (ShowCollisionDebug)
+            if (ShowCollisionDebug || CastApproximateShadows)
             {
+                var mf = collisionGo.AddComponent<MeshFilter>();
+                mf.sharedMesh = Proxy.CollisionMesh;
                 var mr = collisionGo.AddComponent<MeshRenderer>();
-                var mf = new Material(Shader.Find("Universal Render Pipeline/Unlit")) { name = "S2P_CollisionDebug" };
-                mf.SetColor("_BaseColor", new Color(0f, 1f, 0.4f, 0.35f));
-                mr.sharedMaterial = mf;
+                var shader = Shader.Find("Universal Render Pipeline/Lit")
+                             ?? Shader.Find("Universal Render Pipeline/Simple Lit")
+                             ?? Shader.Find("Universal Render Pipeline/Unlit");
+                var mat = new Material(shader)
+                {
+                    name = "S2P_CollisionDebug",
+                    hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild
+                };
+                mat.SetColor("_BaseColor", new Color(0f, 1f, 0.4f, 0.35f));
+                mr.sharedMaterial = mat;
+                mr.shadowCastingMode = ShowCollisionDebug
+                    ? (CastApproximateShadows ? ShadowCastingMode.On : ShadowCastingMode.Off)
+                    : ShadowCastingMode.ShadowsOnly;
             }
+
+            S2PLightProxyRegistry.RegisterShadowMesh(Proxy.CollisionMesh);
         }
     }
 }

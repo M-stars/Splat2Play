@@ -77,7 +77,7 @@ namespace Splat2Play.Runtime
                     float3 mn, mx;
                     if (p > 0.01f)
                     {
-                        ComputePercentileBounds(positions, p, out mn, out mx);
+                        ComputePercentileBounds(positions, exclusions, p, out mn, out mx);
                         if (math.any(mx - mn < 1e-3f)) { mn = float3.zero; mx = float3.zero; } // 退化保护
                     }
                     else
@@ -123,9 +123,10 @@ namespace Splat2Play.Runtime
                         new FillJob
                         {
                             Grid = grid, ThresholdQ16 = (int)(settings.DensityThreshold * 65536f),
+                            SkipInteriorFill = !settings.FillInterior,
                             SealVolumes = seals, DensityQ16 = density, Stats = stats
                         }.Schedule().Complete();
-                        Progress($"洪泛填充完成(密度和 {stats[0]}, 实心体素 {stats[1]})", 0.65f);
+                        Progress($"洪泛填充完成(fillInterior={settings.FillInterior}, 密度和 {stats[0]}, 实心体素 {stats[1]})", 0.65f);
                         using (var hres2 = new NativeArray<ulong>(1, Allocator.TempJob, NativeArrayOptions.ClearMemory))
                         {
                             new HashJob { Data = density, Result = hres2 }.Schedule().Complete();
@@ -143,7 +144,7 @@ namespace Splat2Play.Runtime
                             Grid = grid, Threshold = settings.DensityThreshold,
                             DensityQ16 = density, Vertices = vertices, Triangles = triangles
                         }.Schedule().Complete();
-                        Progress($"[SURF] n={vertices.Length} v0={vertices[0]} gridMin={grid.Min} step={grid.Step}", 0.8f);
+                        Progress($"[SURF] n={vertices.Length} v0={(vertices.Length > 0 ? vertices[0] : float3.zero)} gridMin={grid.Min} step={grid.Step}", 0.8f);
                         {
                             int bad = 0; float maxAbs = 0f;
                             for (int i = 0; i < vertices.Length; ++i)
@@ -221,8 +222,8 @@ namespace Splat2Play.Runtime
             }
         }
 
-        /// <summary>百分位包围盒:逐轴取 [p, 100-p] 分位(采样后排序,确定性)。</summary>
-        static void ComputePercentileBounds(NativeArray<float3> positions, float percentile, out float3 mn, out float3 mx)
+        /// <summary>百分位包围盒:逐轴取 [p, 100-p] 分位(采样后排序,过滤排除区,确定性)。</summary>
+        static void ComputePercentileBounds(NativeArray<float3> positions, NativeArray<AabbRange> exclusions, float percentile, out float3 mn, out float3 mx)
         {
             int sampleCount = math.min(positions.Length, 8192);
             int stride = math.max(1, positions.Length / sampleCount);
@@ -232,7 +233,17 @@ namespace Splat2Play.Runtime
             for (int i = 0; i < positions.Length; i += stride)
             {
                 float3 p = positions[i];
+                bool excluded = false;
+                for (int e = 0; e < exclusions.Length; ++e)
+                    if (exclusions[e].Contains(p)) { excluded = true; break; }
+                if (excluded) continue;
                 xs.Add(p.x); ys.Add(p.y); zs.Add(p.z);
+            }
+            if (xs.Count == 0)
+            {
+                mn = float3.zero;
+                mx = float3.zero;
+                return;
             }
             float lo = percentile, hi = 100f - percentile;
             mn = new float3(Pct(xs, lo), Pct(ys, lo), Pct(zs, lo));

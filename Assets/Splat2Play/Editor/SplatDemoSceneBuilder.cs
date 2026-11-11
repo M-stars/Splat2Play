@@ -73,7 +73,9 @@ namespace Splat2Play.Editor
             renderer.m_SHOrder = 2;                    // 首版性能保守值
             var level = levelGo.AddComponent<SplatLevel>();
             level.SplatRenderer = renderer;
-            levelGo.AddComponent<NavMeshSurface>();    // T2.1:烘焙源=代理网格(装配后手动 Bake)
+            var surface = levelGo.AddComponent<NavMeshSurface>(); // T2.1:烘焙源=代理碰撞网格(装配后手动 Bake)
+            surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
+            surface.collectObjects = CollectObjects.Children;
             var panel = levelGo.AddComponent<S2PPerfPanel>();
             panel.SplatRenderer = renderer;
             var streaming = levelGo.AddComponent<S2PSplatStreaming>();
@@ -108,6 +110,10 @@ namespace Splat2Play.Editor
             flashlight.shadows = LightShadows.Soft;
             flashlight.color = new Color(1f, 0.96f, 0.9f);
             flashlight.name = "Flashlight";
+
+            var lightDriver = levelGo.AddComponent<S2PLightModulationDriver>();
+            lightDriver.Flashlight = flashlight;
+            streaming.Camera = cam;
 
             // —— 敌人 ——
             var enemy = GameObject.CreatePrimitive(PrimitiveType.Capsule);

@@ -14,12 +14,14 @@ namespace Splat2Play.Runtime
         public float RepathInterval = 0.25f;
 
         NavMeshAgent _agent;
+        Vector3 _spawnPosition;
         float _nextRepath;
         int _catchCount;
 
         void OnEnable()
         {
             _agent = GetComponent<NavMeshAgent>();
+            _spawnPosition = transform.position;
             if (Target == null)
             {
                 var player = GameObject.FindGameObjectWithTag("Player");
@@ -42,11 +44,8 @@ namespace Splat2Play.Runtime
             {
                 ++_catchCount;
                 Debug.Log($"[Splat2Play] 敌人抓住玩家(第 {_catchCount} 次),位置 {transform.position:F1}");
-                // 重置到出生点,便于演示连续性
-                if (TryGetComponent(out NavMeshAgent a))
-                {
-                    a.Warp(transform.position + Vector3.up * 0.5f);
-                }
+                // 重置回初始出生点,便于演示连续性
+                _agent.Warp(_spawnPosition);
             }
         }
     }

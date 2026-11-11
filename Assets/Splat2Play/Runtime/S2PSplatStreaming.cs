@@ -32,11 +32,15 @@ namespace Splat2Play.Runtime
 
         void Update()
         {
-            if (Target == null) return;
+            if (Target == null || Target.isLoading) return;
             var cam = Camera != null ? Camera : Camera.main;
             if (cam == null) return;
 
-            Vector3 center = transform.TransformPoint(Target.localBounds.center);
+            Bounds localB = Target.localBounds;
+            if (localB.size.sqrMagnitude < 1e-4f && TryGetComponent<SplatLevel>(out var lvl) && lvl.Proxy != null)
+                localB = lvl.Proxy.SceneBounds;
+
+            Vector3 center = transform.TransformPoint(localB.center);
             float dist = Vector3.Distance(cam.transform.position, center);
 
             if (dist <= FullDistance)
@@ -63,15 +67,16 @@ namespace Splat2Play.Runtime
         {
             if (CurrentState == state) return;
             CurrentState = state;
+            int maxSh = Target.sourceSHDegree > 0 ? Target.sourceSHDegree : 3;
             switch (state)
             {
                 case SplatStreamState.Full:
                     if (!Target.isActiveAndEnabled) Target.enabled = true;
-                    Target.m_SHOrder = Target.sourceSHDegree;
+                    Target.m_SHOrder = maxSh;
                     break;
                 case SplatStreamState.Reduced:
                     if (!Target.isActiveAndEnabled) Target.enabled = true;
-                    Target.m_SHOrder = Mathf.Min(FarSHOrder, Target.sourceSHDegree);
+                    Target.m_SHOrder = Mathf.Min(FarSHOrder, maxSh);
                     break;
                 case SplatStreamState.Unloaded:
                     Target.enabled = false; // OnDisable 释放 GPU 缓冲;重新启用时自动 Reload

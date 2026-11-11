@@ -15,6 +15,8 @@ namespace Splat2Play.Runtime
     {
         public Light Flashlight;
         [Range(0f, 3f)] public float Intensity = 1.6f;
+        [Range(0f, 1f)] [Tooltip("手电筒光锥外/阴影区的环境保留亮度比例(越小明暗反差越强)")]
+        public float AmbientFloor = 0.35f;
         [Tooltip("阴影深度比较偏移(反转 z 单位)")]
         public float Bias = 0.002f;
         [Tooltip("附加光阴影切片索引(单灯场景 = 0)")]
@@ -22,15 +24,23 @@ namespace Splat2Play.Runtime
 
         public void SetGlobalsNow()
         {
-            if (Flashlight == null || !Flashlight.isActiveAndEnabled) return;
+            if (Flashlight == null || !Flashlight.isActiveAndEnabled)
+            {
+                Shader.SetGlobalInt("_S2PLightEnabled", 0);
+                return;
+            }
+            S2PLightProxyRegistry.RegisterSpotLight(Flashlight);
             var t = Flashlight.transform;
+            Shader.SetGlobalInt("_S2PLightEnabled", 1);
             Shader.SetGlobalVector("_S2PLightPos", t.position);
             Shader.SetGlobalVector("_S2PLightDir", t.forward);
+            Shader.SetGlobalVector("_S2PLightColor", (Vector4)Flashlight.color);
             Shader.SetGlobalFloat("_S2PLightRange", Mathf.Max(1f, Flashlight.range));
             Shader.SetGlobalFloat("_S2PLightCos", Mathf.Cos(Flashlight.spotAngle * 0.5f * Mathf.Deg2Rad));
             Shader.SetGlobalInt("_S2PLightSlice", ShadowSlice);
             Shader.SetGlobalFloat("_S2PBias", Bias);
             Shader.SetGlobalFloat("_S2PIntensity", Intensity);
+            Shader.SetGlobalFloat("_S2PAmbient", AmbientFloor);
         }
 
         void LateUpdate()
@@ -39,5 +49,11 @@ namespace Splat2Play.Runtime
         }
 
         void OnEnable() => SetGlobalsNow();
+
+        void OnDisable()
+        {
+            if (Flashlight != null) S2PLightProxyRegistry.UnregisterSpotLight(Flashlight);
+            Shader.SetGlobalInt("_S2PLightEnabled", 0);
+        }
     }
 }

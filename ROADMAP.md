@@ -20,11 +20,11 @@
 - **退出标准:** 玩家胶囊体在扫描街道上行走,不穿墙不掉地 ✅(Raycast 6/6 验证)
 - 已知风险:细长结构(栅栏、灯杆)对密度阈值的敏感性 → 手工补丁笔刷兜底
 
-### M2 — NavMesh 桥接 + AI 原型(W5–6)
+### M2 — NavMesh 桥接 + AI 原型(W5–6)✅ 2026-11-11
 
-- 代理网格 → Unity NavMesh 烘焙,接入 NavMeshAgent
-- 可玩原型:敌人 AI 在扫描关卡中追击玩家
-- **退出标准:** AI 沿真实地形追到玩家;录制演示片段
+- 代理网格 → Unity NavMesh 烘焙(`PhysicsColliders`),接入 NavMeshAgent
+- 可玩原型:第一人称控制器(`SplatFPSController`) + 敌人 AI(`EnemyChaser`)在扫描关卡中追击玩家
+- **退出标准:** NavMesh 在真实扫描代理上烘焙通过,AI 沿真实地形追击并支持抓捕重置 ✅(`SplatDemoSceneBuilder` 一键构建)
 
 ### M3 — 近似动态光照(W7–8)✅ 2026-11-11· 核心模块二
 

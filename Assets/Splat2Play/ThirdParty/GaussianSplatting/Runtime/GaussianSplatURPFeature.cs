@@ -135,6 +135,10 @@ namespace GaussianSplatting.Runtime
                     cameraColor = new RenderTargetIdentifier(cameraColor, 0, CubemapFace.Unknown, data.TargetSlice);
                     CoreUtils.SetRenderTarget(commandBuffer, cameraColor);
                     commandBuffer.SetViewport(new Rect(0, 0, data.Width, data.Height));
+                    commandBuffer.SetGlobalVector("_SplatRenderSize", new Vector4(data.Width, data.Height, 0, 0));
+                    commandBuffer.SetGlobalMatrix("_SplatInvViewProjection", (data.Projection * data.View).inverse);
+                    commandBuffer.SetGlobalTexture("_S2PSceneDepthTexture", data.SourceDepth);
+                    commandBuffer.SetGlobalInt("_S2PHasSplatDepth", data.Filter == StochasticTemporalFilter.Reprojected ? 1 : 0);
                     commandBuffer.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3);
                     commandBuffer.EndSample(GaussianSplatRenderSystem.s_ProfCompose);
                 });

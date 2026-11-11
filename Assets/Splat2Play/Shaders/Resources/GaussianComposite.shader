@@ -20,11 +20,73 @@ v2f vert (uint vtxID : SV_VertexID)
 }
 
 Texture2D _GaussianSplatRT;
+Texture2D _GaussianSplatDepthRT;
+Texture2D _S2PSceneDepthTexture;
+SamplerState sampler_LinearClamp;
+
+float4x4 _SplatInvViewProjection;
+float2 _SplatRenderSize;
+float4 _CameraTargetTexture_TexelSize;
+int _S2PHasSplatDepth;
+
+// —— S2P M3:近似动态光照(手电筒) ——
+int _S2PLightEnabled;
+float3 _S2PLightPos;
+float3 _S2PLightDir;
+float3 _S2PLightColor;
+float _S2PLightRange;
+float _S2PLightCos;    // cos(半锥角)
+int _S2PLightSlice;    // 附加光阴影切片索引
+float _S2PBias;
+float _S2PIntensity;
+float _S2PAmbient;
+float4x4 _AdditionalLightsWorldToShadow[256];
+Texture2D _AdditionalLightsShadowmapTexture;
 
 half4 frag (v2f i) : SV_Target
 {
     half4 col = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
     col.rgb = GammaToLinearSpace(col.a != 0 ? col.rgb/col.a : col.rgb);
+    if (_S2PLightEnabled != 0 && col.a > 0.001)
+    {
+        int3 px = int3(i.vertex.xy, 0);
+        float depth = _S2PHasSplatDepth != 0 ? _GaussianSplatDepthRT.Load(px).r : 0.0;
+        if (depth <= 1e-6)
+            depth = _S2PSceneDepthTexture.Load(px).r;
+        if (depth > 1e-6)
+        {
+            float2 size = max(_SplatRenderSize.xy, float2(1.0, 1.0));
+            float2 clipXY = i.vertex.xy / size * 2.0 - 1.0;
+            float projectionY = _CameraTargetTexture_TexelSize.z == 1.0 ? 1.0 : -1.0;
+            clipXY.y *= projectionY;
+            float4 world4 = mul(_SplatInvViewProjection, float4(clipXY, depth, 1.0));
+            float3 world = world4.xyz / max(abs(world4.w), 1e-6);
+            float3 toPixel = world - _S2PLightPos;
+            float dist = length(toPixel);
+            float3 ldir = dist > 1e-4 ? toPixel / dist : _S2PLightDir;
+            float cone = smoothstep(_S2PLightCos, _S2PLightCos + 0.08, dot(ldir, _S2PLightDir));
+            float atten = saturate(1.0 - dist / max(_S2PLightRange, 1.0));
+            atten *= atten;
+
+            float lit = 1.0;
+            float4 shadowCoord = mul(_AdditionalLightsWorldToShadow[_S2PLightSlice], float4(world, 1.0));
+            if (shadowCoord.w > 1e-4)
+            {
+                float3 sc = shadowCoord.xyz / shadowCoord.w;
+                if (all(sc.xy > 0.001) && all(sc.xy < 0.999) && sc.z > 0.0 && sc.z < 1.0)
+                {
+                    float mapZ = _AdditionalLightsShadowmapTexture.SampleLevel(sampler_LinearClamp, sc.xy, 0).r;
+                    // Reversed-Z: 遮挡物离光源更近则 mapZ > sc.z
+                    if (mapZ > 0.0)
+                        lit = saturate((sc.z - mapZ + _S2PBias) / max(_S2PBias, 1e-4));
+                }
+            }
+            float factor = cone * atten * lit * _S2PIntensity;
+            float3 lightTint = any(_S2PLightColor > 0.0) ? _S2PLightColor : float3(1.0, 0.96, 0.9);
+            float ambient = _S2PAmbient > 0.0 ? _S2PAmbient : 0.35;
+            col.rgb = col.rgb * lerp(ambient, 1.0, saturate(cone * atten * lit)) + col.rgb * lightTint * factor;
+        }
+    }
     return float4(col.rgb, col.a);
 }
 ENDCG
@@ -56,25 +118,10 @@ CGPROGRAM
 Texture2D _SplatHistory;
 
 #if defined(SPLAT_REPROJECTED)
-Texture2D _GaussianSplatDepthRT;
 SamplerState linear_clamp_sampler;
-float4x4 _SplatInvViewProjection;
 float4x4 _SplatPreviousViewProjection;
 float3 _SplatCameraPosition;
 uint _SplatOrthographic;
-float2 _SplatRenderSize; // need externally passed RT size; in URP/HDRP RTHandle backing texture can be larger
-float4 _CameraTargetTexture_TexelSize;
-
-// —— S2P M3:近似动态光照(手电筒) ——
-float3 _S2PLightPos;
-float3 _S2PLightDir;
-float _S2PLightRange;
-float _S2PLightCos;    // cos(半锥角)
-int _S2PLightSlice;    // 附加光阴影切片索引
-float _S2PBias;
-float _S2PIntensity;
-Texture2D _AdditionalLightsShadowmapTexture;
-SamplerState smp_linear_clamp_compare_s2p;
 
 // use YCoCg for history rejection, similar to SteadySplats
 float4 HistoryColor(float4 color)
@@ -156,28 +203,7 @@ half4 fragAccumulate(v2f i) : SV_Target
 {
     half4 current = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
 #if defined(SPLAT_REPROJECTED)
-    half4 modulated = ReprojectHistory(i.vertex.xy, current);
-    // —— S2P:手电筒近似动态光照 ——
-    if (modulated.a > 0.001)
-    {
-        float depth = _GaussianSplatDepthRT.Load(int3(i.vertex.xy, 0)).r;
-        float2 clipXY = i.vertex.xy / _SplatRenderSize.xy * 2.0 - 1.0;
-        float4 world4 = mul(_SplatInvViewProjection, float4(clipXY, depth, 1));
-        float3 world = world4.xyz / world4.w;
-        float3 toPixel = world - _S2PLightPos;
-        float dist = length(toPixel);
-        float3 ldir = dist > 1e-4 ? toPixel / dist : _S2PLightDir;
-        float cone = smoothstep(_S2PLightCos, _S2PLightCos + 0.08, dot(ldir, _S2PLightDir));
-        float atten = saturate(1.0 - dist / _S2PLightRange); atten *= atten;
-        float4 shadowCoord = mul(_AdditionalLightsWorldToShadow[_S2PLightSlice], float4(world, 1.0));
-        float2 suv = shadowCoord.xy / shadowCoord.w * 0.5 + 0.5;
-        float casterZ = shadowCoord.z / shadowCoord.w;
-        float receiverZ = _AdditionalLightsShadowmapTexture.SampleLevel(smp_linear_clamp_compare_s2p, suv, 0).r;
-        float lit = saturate((receiverZ - casterZ + _S2PBias) / _S2PBias);
-        float factor = cone * atten * lit * _S2PIntensity;
-        modulated.rgb += float3(1.0, 0.96, 0.9) * factor * modulated.a;
-    }
-    return modulated;
+    return ReprojectHistory(i.vertex.xy, current);
 #else
     // at reset weight=1, just copy without reading uninitialized history
     if (_SplatFrameWeight == 1.0)
