@@ -30,7 +30,20 @@ namespace Splat2Play.Runtime
         [Tooltip("M3:代理网格是否以 ShadowsOnly 模式投射近似动态阴影")]
         public bool CastApproximateShadows = true;
 
+        [Tooltip("M2:烘焙 NavMesh 时优先使用低面数 NavigationMesh(≤ 4 万面)以加速寻路网格生成")]
+        public bool UseCoarseNavMeshProxy = true;
+
         const string kCollisionChild = "S2P_Collision";
+
+        /// <summary>在烘焙 NavMesh 前后切换碰撞体网格为 NavigationMesh / CollisionMesh。</summary>
+        public void SwapToNavigationMesh(bool useNavMesh)
+        {
+            if (Proxy == null || !UseCoarseNavMeshProxy || Proxy.NavigationMesh == null) return;
+            var child = transform.Find(kCollisionChild);
+            if (child == null) return;
+            if (child.TryGetComponent<MeshCollider>(out var mc))
+                mc.sharedMesh = useNavMesh ? Proxy.NavigationMesh : Proxy.CollisionMesh;
+        }
 
         /// <summary>按 ProxyData 装配/重建碰撞子节点。编辑器与运行时均可调用。</summary>
         public void BuildCollision()

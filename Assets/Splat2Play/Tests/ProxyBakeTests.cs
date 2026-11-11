@@ -340,6 +340,10 @@ namespace Splat2Play.Tests
                     var stW = new NativeArray<long>(2, Allocator.TempJob, NativeArrayOptions.ClearMemory);
                     try { new FillJob { Grid = grid, ThresholdQ16 = 32768, SealVolumes = seals, DensityQ16 = density, Stats = stW }.Schedule().Complete(); }
                     finally { stW.Dispose(); }
+                    using (var sdfW = new NativeArray<int>(grid.Count, Allocator.TempJob, NativeArrayOptions.ClearMemory))
+                    {
+                        new SdfSmoothJob { Grid = grid, SrcDensityQ16 = density, DstDensityQ16 = sdfW }.Schedule(grid.N, 1).Complete();
+                    }
                     new SurfaceNetsJob { Grid = grid, Threshold = 0.5f, DensityQ16 = density, Vertices = verts, Triangles = tris }.Schedule().Complete();
                     var diagW = new NativeArray<long>(13, Allocator.TempJob, NativeArrayOptions.ClearMemory);
                 try
@@ -380,6 +384,11 @@ namespace Splat2Play.Tests
                 using var res = SplatProxyBaker.Bake(new MemoryStream(ply), settings);
                 Assert.Less(res.SceneBounds.size.x, 5f, "排除区内的远距离离群点不应撑大 SceneBounds");
                 Assert.Greater(res.Mesh.normals.Length, 0, "BuildMesh 应生成顶点法线");
+                Assert.IsNotNull(res.NavigationMesh, "默认应同时生成低面数 NavigationMesh");
+                Assert.LessOrEqual(res.NavTriangleCount, res.TriangleCount, "导航代理面数不应超过碰撞代理");
+                Assert.IsNotNull(res.ChunkBounds, "应生成分块包围盒");
+                Assert.Greater(res.ChunkBounds.Count, 0, "至少包含 1 个有效空间分块");
+                Assert.AreEqual(res.ChunkBounds.Count, res.ChunkSplatCounts.Count, "分块包围盒与计数数组长度应一致");
             }
             finally
             {

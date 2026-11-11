@@ -18,11 +18,15 @@ namespace Splat2Play.Runtime
     public sealed class ProxyBakeResult : IDisposable
     {
         public Mesh Mesh;
+        public Mesh NavigationMesh;
         public Bounds SceneBounds;
         public int SplatCount;
         public int TriangleCount;
+        public int NavTriangleCount;
         public int VoxelResolution;
         public float DensityThreshold;
+        public System.Collections.Generic.List<Bounds> ChunkBounds = new();
+        public System.Collections.Generic.List<int> ChunkSplatCounts = new();
         public string Log;   // 各阶段耗时与决策,供 benchmarks 汇总
         public bool Disposed { get; private set; }
         public void Dispose()
@@ -30,6 +34,7 @@ namespace Splat2Play.Runtime
             if (!Disposed)
             {
                 if (Mesh != null) UnityEngine.Object.DestroyImmediate(Mesh);
+                if (NavigationMesh != null) UnityEngine.Object.DestroyImmediate(NavigationMesh);
                 Disposed = true;
             }
         }
@@ -86,7 +91,7 @@ namespace Splat2Play.Runtime
                         mn = mmResult[0]; mx = mmResult[1];
                     }
 
-                    float margin = 0.5f;
+                    float margin = Mathf.Clamp(settings.BoundsMargin, 0f, 5f);
                     float3 pctMin = mn, pctMax = mx; // 百分位盒(不含 margin),供取景/玩法使用
                     mn -= margin; mx += margin;
                     float3 size = mx - mn;
@@ -98,7 +103,10 @@ namespace Splat2Play.Runtime
                         Min = mn - (new float3(maxAxis, maxAxis, maxAxis) - size) * 0.5f, // 居中,保证三轴同分辨率
                         Step = maxAxis / res
                     };
-                    Progress($"体素网格 {res}³(步长 {grid.Step:F3}m, 场景 {maxAxis:F1}m)", 0.12f);
+                    Progress($"体素网格 {res}³(步长 {grid.Step:F3}m, 场景 {maxAxis:F1}m, margin={margin:F2}m)", 0.12f);
+
+                    // 提取 M4 空间分块包围盒(4×2×4 子块)
+                    BuildSpatialChunks(splats, exclusions, pctMin, pctMax, out var chunkBounds, out var chunkCounts);
 
                 // —— 3. 体素化 ——
                 var density = new NativeArray<int>(grid.Count, Allocator.Persistent, NativeArrayOptions.ClearMemory);
@@ -130,6 +138,26 @@ namespace Splat2Play.Runtime
                         {
                             new HashJob { Data = density, Result = hres2 }.Schedule().Complete();
                             log.AppendLine($"[诊断] 填充后密度哈希 {hres2[0]:X}");
+                        }
+                    }
+
+                    // —— 4.5 可选 SDF 平滑(§5.1 useSDF,512 档自动跳过以保证内存峰值 <2GB) ——
+                    bool applySdf = settings.UseSDF && res < 512;
+                    if (settings.UseSDF && res >= 512)
+                        log.AppendLine("[警告] 512³ 分辨率下已自动跳过 SDF 平滑以控制内存峰值(<2GB)");
+                    if (applySdf)
+                    {
+                        var sdfFiltered = new NativeArray<int>(grid.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                        try
+                        {
+                            new SdfSmoothJob { Grid = grid, SrcDensityQ16 = density, DstDensityQ16 = sdfFiltered }
+                                .Schedule(res, 4).Complete();
+                            density.CopyFrom(sdfFiltered);
+                            Progress("SDF 距离场平滑完成", 0.72f);
+                        }
+                        finally
+                        {
+                            if (sdfFiltered.IsCreated) sdfFiltered.Dispose();
                         }
                     }
 
@@ -188,18 +216,47 @@ namespace Splat2Play.Runtime
                         if (triangles.Count / 3 > settings.MaxTriangles)
                             log.AppendLine($"[警告] 面数 {triangles.Count / 3:N0} 仍高于目标 {settings.MaxTriangles:N0}(已达抽稀上限)");
 
-                        // —— 7. 组装 Mesh ——
-                        var mesh = BuildMesh(vertices, triangles, grid, log);
+                        // —— 7. 组装碰撞 Mesh 与可选寻路粗 Mesh(§5.2) ——
+                        int collTris = triangles.Length / 3;
+                        var mesh = BuildMesh(vertices, triangles, grid, log, "S2P_ProxyCollision");
+                        Mesh navMesh = null;
+                        int navTris = collTris;
+                        if (settings.BakeNavigationMesh && triangles.Length / 3 > settings.MaxNavTriangles)
+                        {
+                            var diagNav = new NativeArray<long>(13, Allocator.TempJob, NativeArrayOptions.ClearMemory);
+                            try
+                            {
+                                while (triangles.Length / 3 > settings.MaxNavTriangles && decimPasses < 8)
+                                {
+                                    float step = grid.Step * Mathf.Pow(2f, decimPasses + 1);
+                                    new DecimateJob
+                                    {
+                                        ClusterStep = step, GridMin = grid.Min,
+                                        BoundMin = grid.Min - grid.Step,
+                                        BoundMax = grid.Min + (grid.N + 1) * grid.Step,
+                                        Vertices = vertices, Triangles = triangles, Diag = diagNav
+                                    }.Schedule().Complete();
+                                    ++decimPasses;
+                                }
+                            }
+                            finally { diagNav.Dispose(); }
+                            navTris = triangles.Length / 3;
+                            navMesh = BuildMesh(vertices, triangles, grid, log, "S2P_ProxyNavigation");
+                        }
                         Progress("烘焙完成", 1f);
 
                         return new ProxyBakeResult
                         {
                             Mesh = mesh,
+                            NavigationMesh = navMesh,
                             SceneBounds = new Bounds((pctMin + pctMax) * 0.5f, pctMax - pctMin), // 百分位盒:有意义的玩法范围
                             SplatCount = header.SplatCount,
-                            TriangleCount = triangles.Count / 3,
+                            TriangleCount = collTris,
+                            NavTriangleCount = navTris,
                             VoxelResolution = res,
                             DensityThreshold = settings.DensityThreshold,
+                            ChunkBounds = chunkBounds,
+                            ChunkSplatCounts = chunkCounts,
                             Log = log.ToString()
                         };
                     }
@@ -269,7 +326,54 @@ namespace Splat2Play.Runtime
             return arr;
         }
 
-        static Mesh BuildMesh(NativeList<float3> vertices, NativeList<int> triangles, VoxelGridInfo grid, System.Text.StringBuilder log)
+        static void BuildSpatialChunks(NativeArray<SplatRaw> splats, NativeArray<AabbRange> exclusions,
+                                       float3 bMin, float3 bMax,
+                                       out System.Collections.Generic.List<Bounds> chunkBounds,
+                                       out System.Collections.Generic.List<int> chunkCounts)
+        {
+            const int kx = 4, ky = 2, kz = 4;
+            const int total = kx * ky * kz;
+            chunkBounds = new System.Collections.Generic.List<Bounds>(total);
+            chunkCounts = new System.Collections.Generic.List<int>(total);
+            float3 span = math.max(bMax - bMin, new float3(1e-3f));
+            var counts = new int[total];
+            var mins = new float3[total];
+            var maxs = new float3[total];
+            for (int i = 0; i < total; ++i)
+            {
+                mins[i] = new float3(float.PositiveInfinity);
+                maxs[i] = new float3(float.NegativeInfinity);
+            }
+
+            int stride = math.max(1, splats.Length / 65536); // 采样加速并按比例放大计数
+            for (int i = 0; i < splats.Length; i += stride)
+            {
+                float3 p = splats[i].Position;
+                bool excluded = false;
+                for (int e = 0; e < exclusions.Length; ++e)
+                    if (exclusions[e].Contains(p)) { excluded = true; break; }
+                if (excluded) continue;
+                float3 norm = math.saturate((p - bMin) / span);
+                int ix = math.clamp((int)(norm.x * kx), 0, kx - 1);
+                int iy = math.clamp((int)(norm.y * ky), 0, ky - 1);
+                int iz = math.clamp((int)(norm.z * kz), 0, kz - 1);
+                int ci = ix + iy * kx + iz * kx * ky;
+                counts[ci] += stride;
+                mins[ci] = math.min(mins[ci], p);
+                maxs[ci] = math.max(maxs[ci], p);
+            }
+
+            for (int i = 0; i < total; ++i)
+            {
+                if (counts[i] <= 0) continue;
+                Vector3 c = (Vector3)((mins[i] + maxs[i]) * 0.5f);
+                Vector3 s = (Vector3)math.max(maxs[i] - mins[i], new float3(0.2f));
+                chunkBounds.Add(new Bounds(c, s));
+                chunkCounts.Add(math.min(counts[i], splats.Length));
+            }
+        }
+
+        static Mesh BuildMesh(NativeList<float3> vertices, NativeList<int> triangles, VoxelGridInfo grid, System.Text.StringBuilder log, string meshName = "S2P_ProxyCollision")
         {
             // 最后一道防线(托管侧):丢弃非有限/超界顶点并重映射索引,保证碰撞网格永远有效
             var cleanV = new System.Collections.Generic.List<Vector3>((int)vertices.Length);
@@ -294,14 +398,14 @@ namespace Splat2Play.Runtime
 
             var mesh = new Mesh
             {
-                name = "S2P_ProxyCollision",
+                name = meshName,
                 indexFormat = cleanV.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16
             };
             mesh.vertices = cleanV.ToArray();
             mesh.SetIndices(cleanT.ToArray(), MeshTopology.Triangles, 0, false);
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
-            log.AppendLine($"Mesh: {cleanV.Count:N0} 顶点 / {cleanT.Count / 3:N0} 三角形(原始 {vertices.Length:N0}/{triangles.Count / 3:N0},丢弃脏顶点 {vertices.Length - cleanV.Count:N0}、脏三角形 {droppedTris:N0}) | bounds={mesh.bounds.size:F2} center={mesh.bounds.center:F2}");
+            log.AppendLine($"{meshName}: {cleanV.Count:N0} 顶点 / {cleanT.Count / 3:N0} 三角形(原始 {vertices.Length:N0}/{triangles.Count / 3:N0},丢弃脏顶点 {vertices.Length - cleanV.Count:N0}、脏三角形 {droppedTris:N0}) | bounds={mesh.bounds.size:F2} center={mesh.bounds.center:F2}");
             return mesh;
         }
 

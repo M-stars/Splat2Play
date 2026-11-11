@@ -276,6 +276,60 @@ namespace Splat2Play.Runtime
     }
 
     /// <summary>
+    /// T1.4 有向距离场平滑(SDF Smoothing, §5.1 useSDF):
+    /// 使用 3×3×3 二项式核 [1,2,1]³ / 64 对填充后的二值/连续密度场做确定性整数平滑,
+    /// 将阶梯体素边界转化为带宽 ±1.5 体素的平滑距离场,保持平坦等值面零偏移。
+    /// 按 Z 层并行(IJobParallelFor),纯整数位移无浮点非确定性。
+    /// </summary>
+    [BurstCompile]
+    public struct SdfSmoothJob : IJobParallelFor
+    {
+        public VoxelGridInfo Grid;
+        [ReadOnly] public NativeArray<int> SrcDensityQ16;
+        [NativeDisableParallelForRestriction] public NativeArray<int> DstDensityQ16;
+
+        const int kOutsideBit = unchecked((int)0x80000000);
+
+        public void Execute(int z)
+        {
+            int n = Grid.N;
+            int n2 = n * n;
+            int z0 = math.max(0, z - 1), z1 = z, z2 = math.min(n - 1, z + 1);
+
+            for (int y = 0; y < n; ++y)
+            {
+                int y0 = math.max(0, y - 1), y1 = y, y2 = math.min(n - 1, y + 1);
+                for (int x = 0; x < n; ++x)
+                {
+                    int x0 = math.max(0, x - 1), x1 = x, x2 = math.min(n - 1, x + 1);
+                    int centerIdx = x + y * n + z * n2;
+                    int outsideFlag = SrcDensityQ16[centerIdx] & kOutsideBit;
+
+                    long sum = 0;
+                    for (int dz = -1; dz <= 1; ++dz)
+                    {
+                        int zz = dz < 0 ? z0 : (dz == 0 ? z1 : z2);
+                        int wz = dz == 0 ? 2 : 1;
+                        for (int dy = -1; dy <= 1; ++dy)
+                        {
+                            int yy = dy < 0 ? y0 : (dy == 0 ? y1 : y2);
+                            int wyz = wz * (dy == 0 ? 2 : 1);
+                            int rowBase = yy * n + zz * n2;
+                            int d0 = math.min(SrcDensityQ16[x0 + rowBase] & 0x7FFFFFFF, 131072);
+                            int d1 = math.min(SrcDensityQ16[x1 + rowBase] & 0x7FFFFFFF, 131072);
+                            int d2 = math.min(SrcDensityQ16[x2 + rowBase] & 0x7FFFFFFF, 131072);
+                            sum += wyz * (d0 + 2 * d1 + d2);
+                        }
+                    }
+
+                    int smoothed = (int)((sum + 32) >> 6);
+                    DstDensityQ16[centerIdx] = smoothed | outsideFlag;
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// T1.4 Surface Nets(朴素版):在密度场(填充后)上按阈值插值取面。
     /// 单线程 IJob;Burst 不支持闭包,边交点累加用 static 局部函数 + ref 参数。
     /// </summary>

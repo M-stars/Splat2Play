@@ -30,7 +30,7 @@ float4 _CameraTargetTexture_TexelSize;
 int _S2PHasSplatDepth;
 
 // —— S2P M3:近似动态光照(手电筒) ——
-int _S2PLightEnabled;
+int _S2PLightEnabled; // 0=Off, 1=ShadowAndNormal, 2=NormalOnly_PathC
 float3 _S2PLightPos;
 float3 _S2PLightDir;
 float3 _S2PLightColor;
@@ -40,8 +40,30 @@ int _S2PLightSlice;    // 附加光阴影切片索引
 float _S2PBias;
 float _S2PIntensity;
 float _S2PAmbient;
+float _S2PNormalStrength;
+float _S2PModulationRadius;
+int _S2PChunkBiasCount;
+float4 _S2PChunkMinBias[8]; // xyz=min, w=biasOffset
+float4 _S2PChunkMax[8];     // xyz=max
 float4x4 _AdditionalLightsWorldToShadow[256];
 Texture2D _AdditionalLightsShadowmapTexture;
+
+float SampleS2PDepth(int2 xy)
+{
+    int3 px = int3(xy, 0);
+    float d = _S2PHasSplatDepth != 0 ? _GaussianSplatDepthRT.Load(px).r : 0.0;
+    if (d <= 1e-6)
+        d = _S2PSceneDepthTexture.Load(px).r;
+    return d;
+}
+
+float3 ReconstructS2PWorld(float2 pixelXY, float depth, float2 size, float projectionY)
+{
+    float2 clipXY = pixelXY / size * 2.0 - 1.0;
+    clipXY.y *= projectionY;
+    float4 world4 = mul(_SplatInvViewProjection, float4(clipXY, depth, 1.0));
+    return world4.xyz / max(abs(world4.w), 1e-6);
+}
 
 half4 frag (v2f i) : SV_Target
 {
@@ -49,42 +71,73 @@ half4 frag (v2f i) : SV_Target
     col.rgb = GammaToLinearSpace(col.a != 0 ? col.rgb/col.a : col.rgb);
     if (_S2PLightEnabled != 0 && col.a > 0.001)
     {
-        int3 px = int3(i.vertex.xy, 0);
-        float depth = _S2PHasSplatDepth != 0 ? _GaussianSplatDepthRT.Load(px).r : 0.0;
-        if (depth <= 1e-6)
-            depth = _S2PSceneDepthTexture.Load(px).r;
+        int2 pxi = int2(i.vertex.xy);
+        float depth = SampleS2PDepth(pxi);
         if (depth > 1e-6)
         {
             float2 size = max(_SplatRenderSize.xy, float2(1.0, 1.0));
-            float2 clipXY = i.vertex.xy / size * 2.0 - 1.0;
             float projectionY = _CameraTargetTexture_TexelSize.z == 1.0 ? 1.0 : -1.0;
-            clipXY.y *= projectionY;
-            float4 world4 = mul(_SplatInvViewProjection, float4(clipXY, depth, 1.0));
-            float3 world = world4.xyz / max(abs(world4.w), 1e-6);
+            float3 world = ReconstructS2PWorld(i.vertex.xy, depth, size, projectionY);
             float3 toPixel = world - _S2PLightPos;
             float dist = length(toPixel);
-            float3 ldir = dist > 1e-4 ? toPixel / dist : _S2PLightDir;
-            float cone = smoothstep(_S2PLightCos, _S2PLightCos + 0.08, dot(ldir, _S2PLightDir));
-            float atten = saturate(1.0 - dist / max(_S2PLightRange, 1.0));
-            atten *= atten;
-
-            float lit = 1.0;
-            float4 shadowCoord = mul(_AdditionalLightsWorldToShadow[_S2PLightSlice], float4(world, 1.0));
-            if (shadowCoord.w > 1e-4)
+            float maxRad = _S2PModulationRadius > 0.0 ? _S2PModulationRadius : 35.0;
+            if (dist <= maxRad)
             {
-                float3 sc = shadowCoord.xyz / shadowCoord.w;
-                if (all(sc.xy > 0.001) && all(sc.xy < 0.999) && sc.z > 0.0 && sc.z < 1.0)
+                float3 ldir = dist > 1e-4 ? toPixel / dist : _S2PLightDir;
+                float cone = smoothstep(_S2PLightCos, _S2PLightCos + 0.08, dot(ldir, _S2PLightDir));
+                float atten = saturate(1.0 - dist / max(_S2PLightRange, 1.0));
+                atten *= atten;
+
+                // 屏幕空间深度差分重建代理法线并计算轻微 N·L 调制(§5.3)
+                float nlFactor = 1.0;
+                if (_S2PNormalStrength > 0.001)
                 {
-                    float mapZ = _AdditionalLightsShadowmapTexture.SampleLevel(sampler_LinearClamp, sc.xy, 0).r;
-                    // Reversed-Z: 遮挡物离光源更近则 mapZ > sc.z
-                    if (mapZ > 0.0)
-                        lit = saturate((sc.z - mapZ + _S2PBias) / max(_S2PBias, 1e-4));
+                    float dRight = SampleS2PDepth(pxi + int2(1, 0));
+                    float dUp    = SampleS2PDepth(pxi + int2(0, 1));
+                    if (dRight > 1e-6 && dUp > 1e-6 && abs(dRight - depth) < 0.02 && abs(dUp - depth) < 0.02)
+                    {
+                        float3 wRight = ReconstructS2PWorld(i.vertex.xy + float2(1.0, 0.0), dRight, size, projectionY);
+                        float3 wUp    = ReconstructS2PWorld(i.vertex.xy + float2(0.0, 1.0), dUp,    size, projectionY);
+                        float3 nrm = normalize(cross(wUp - world, wRight - world));
+                        float ndotl = abs(dot(nrm, -ldir));
+                        nlFactor = lerp(1.0, 0.45 + 0.55 * ndotl, _S2PNormalStrength);
+                    }
                 }
+
+                float lit = 1.0;
+                if (_S2PLightEnabled == 1) // ShadowAndNormal (路径 A/B)
+                {
+                    float effectiveBias = _S2PBias;
+                    [unroll]
+                    for (int cb = 0; cb < 8; ++cb)
+                    {
+                        if (cb >= _S2PChunkBiasCount) break;
+                        if (all(world >= _S2PChunkMinBias[cb].xyz) && all(world <= _S2PChunkMax[cb].xyz))
+                        {
+                            effectiveBias += _S2PChunkMinBias[cb].w;
+                            break;
+                        }
+                    }
+
+                    float4 shadowCoord = mul(_AdditionalLightsWorldToShadow[_S2PLightSlice], float4(world, 1.0));
+                    if (shadowCoord.w > 1e-4)
+                    {
+                        float3 sc = shadowCoord.xyz / shadowCoord.w;
+                        if (all(sc.xy > 0.001) && all(sc.xy < 0.999) && sc.z > 0.0 && sc.z < 1.0)
+                        {
+                            float mapZ = _AdditionalLightsShadowmapTexture.SampleLevel(sampler_LinearClamp, sc.xy, 0).r;
+                            // Reversed-Z: 遮挡物离光源更近则 mapZ > sc.z
+                            if (mapZ > 0.0)
+                                lit = saturate((sc.z - mapZ + effectiveBias) / max(abs(effectiveBias), 1e-4));
+                        }
+                    }
+                }
+
+                float factor = cone * atten * lit * nlFactor * _S2PIntensity;
+                float3 lightTint = any(_S2PLightColor > 0.0) ? _S2PLightColor : float3(1.0, 0.96, 0.9);
+                float ambient = _S2PAmbient > 0.0 ? _S2PAmbient : 0.35;
+                col.rgb = col.rgb * lerp(ambient, 1.0, saturate(cone * atten * lit)) + col.rgb * lightTint * factor;
             }
-            float factor = cone * atten * lit * _S2PIntensity;
-            float3 lightTint = any(_S2PLightColor > 0.0) ? _S2PLightColor : float3(1.0, 0.96, 0.9);
-            float ambient = _S2PAmbient > 0.0 ? _S2PAmbient : 0.35;
-            col.rgb = col.rgb * lerp(ambient, 1.0, saturate(cone * atten * lit)) + col.rgb * lightTint * factor;
         }
     }
     return float4(col.rgb, col.a);

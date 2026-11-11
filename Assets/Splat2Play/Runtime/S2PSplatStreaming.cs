@@ -38,6 +38,9 @@ namespace Splat2Play.Runtime
         public SplatStreamState CurrentState { get; private set; } = SplatStreamState.Full;
         public bool IsOccluded { get; private set; }
         public bool IsFrustumVisible { get; private set; } = true;
+        public int VisibleChunkCount { get; private set; }
+        public int TotalChunkCount { get; private set; }
+        public int VisibleSplatEstimate { get; private set; }
 
         float _pendingUnloadSince = -1f;
         readonly Plane[] _frustumPlanes = new Plane[6];
@@ -48,26 +51,63 @@ namespace Splat2Play.Runtime
             var cam = Camera != null ? Camera : Camera.main;
             if (cam == null) return;
 
+            SplatLevel lvl = null;
+            TryGetComponent(out lvl);
+            ProxyData proxy = lvl != null ? lvl.Proxy : null;
+
             Bounds localB = Target.localBounds;
-            if (localB.size.sqrMagnitude < 1e-4f && TryGetComponent<SplatLevel>(out var lvl) && lvl.Proxy != null)
-                localB = lvl.Proxy.SceneBounds;
+            if (localB.size.sqrMagnitude < 1e-4f && proxy != null)
+                localB = proxy.SceneBounds;
 
-            Vector3 worldCenter = transform.TransformPoint(localB.center);
-            Vector3 worldSize = Vector3.Scale(localB.size, transform.lossyScale);
-            Bounds worldBounds = new(worldCenter, new Vector3(Mathf.Abs(worldSize.x), Mathf.Abs(worldSize.y), Mathf.Abs(worldSize.z)));
-
+            Bounds worldBounds = TransformBounds(localB);
             Vector3 camPos = cam.transform.position;
-            float dist = Vector3.Distance(camPos, worldCenter);
+            float dist = Vector3.Distance(camPos, worldBounds.center);
 
-            // 1. 视锥与保守代理遮挡测试
-            IsFrustumVisible = true;
-            if (EnableFrustumCulling && worldBounds.size.sqrMagnitude > 1e-3f)
+            GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
+
+            // 1. 分块级(Chunk)与整体级视锥 + 保守代理遮挡测试
+            if (proxy != null && proxy.ChunkBounds != null && proxy.ChunkBounds.Count > 0)
             {
-                GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
-                IsFrustumVisible = GeometryUtility.TestPlanesAABB(_frustumPlanes, worldBounds);
-            }
+                TotalChunkCount = proxy.ChunkBounds.Count;
+                int visChunks = 0;
+                int visSplats = 0;
+                bool anyFrustum = false;
+                bool allOccluded = true;
 
-            IsOccluded = EnableOcclusionCulling && CheckConservativeOcclusion(camPos, worldBounds);
+                for (int i = 0; i < TotalChunkCount; ++i)
+                {
+                    Bounds cb = TransformBounds(proxy.ChunkBounds[i]);
+                    float cDist = Vector3.Distance(camPos, cb.center);
+                    if (cDist > CullDistance + cb.extents.magnitude) continue;
+
+                    bool inFrustum = !EnableFrustumCulling || GeometryUtility.TestPlanesAABB(_frustumPlanes, cb);
+                    if (!inFrustum) continue;
+                    anyFrustum = true;
+
+                    bool occ = EnableOcclusionCulling && CheckConservativeOcclusion(camPos, cb);
+                    if (occ) continue;
+
+                    allOccluded = false;
+                    ++visChunks;
+                    if (proxy.ChunkSplatCounts != null && i < proxy.ChunkSplatCounts.Count)
+                        visSplats += proxy.ChunkSplatCounts[i];
+                }
+
+                VisibleChunkCount = visChunks;
+                VisibleSplatEstimate = visSplats;
+                IsFrustumVisible = !EnableFrustumCulling || anyFrustum;
+                IsOccluded = EnableOcclusionCulling && anyFrustum && allOccluded;
+            }
+            else
+            {
+                TotalChunkCount = 1;
+                IsFrustumVisible = !EnableFrustumCulling
+                    || worldBounds.size.sqrMagnitude <= 1e-3f
+                    || GeometryUtility.TestPlanesAABB(_frustumPlanes, worldBounds);
+                IsOccluded = EnableOcclusionCulling && CheckConservativeOcclusion(camPos, worldBounds);
+                VisibleChunkCount = (IsFrustumVisible && !IsOccluded && dist <= CullDistance) ? 1 : 0;
+                VisibleSplatEstimate = VisibleChunkCount > 0 ? Target.splatCount : 0;
+            }
 
             if (!IsFrustumVisible || IsOccluded)
             {
@@ -99,6 +139,13 @@ namespace Splat2Play.Runtime
                 else
                     SetState(SplatStreamState.Reduced);
             }
+        }
+
+        Bounds TransformBounds(Bounds localB)
+        {
+            Vector3 worldCenter = transform.TransformPoint(localB.center);
+            Vector3 worldSize = Vector3.Scale(localB.size, transform.lossyScale);
+            return new Bounds(worldCenter, new Vector3(Mathf.Abs(worldSize.x), Mathf.Abs(worldSize.y), Mathf.Abs(worldSize.z)));
         }
 
         /// <summary>

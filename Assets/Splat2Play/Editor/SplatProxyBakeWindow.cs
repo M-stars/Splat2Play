@@ -22,13 +22,17 @@ namespace Splat2Play.Editor
         ProxyBakeSettings _settings;
         bool _buildLevel = true;
         bool _bakeNavMesh = true;
+        bool _showSceneHandles = true;
         string _lastLog;
+
+        void OnEnable() => SceneView.duringSceneGui += OnSceneGUI;
+        void OnDisable() => SceneView.duringSceneGui -= OnSceneGUI;
 
         void OnGUI()
         {
             EditorGUILayout.HelpBox(
                 "流程:① PLY 路径(或选中场景里的 GaussianSplatRenderer 自动取路径)\n" +
-                "② 烘焙参数 → Bake\n" +
+                "② 烘焙参数 + T1.7 场景盒体可视化微调 → Bake\n" +
                 "③ 自动生成 ProxyData 资产并在场景中一键装配 SplatLevel(碰撞 + NavMesh + 流送 + 性能面板)",
                 MessageType.Info);
 
@@ -52,6 +56,22 @@ namespace Splat2Play.Editor
             if (_settings == null && GUILayout.Button("创建默认参数资产"))
                 _settings = CreateSettingsAsset();
 
+            if (_settings != null)
+            {
+                EditorGUILayout.Space(4);
+                EditorGUILayout.LabelField("T1.7 人工补丁与范围控制 (SceneView 可视化编辑)", EditorStyles.boldLabel);
+                _showSceneHandles = EditorGUILayout.Toggle("Scene 视图显示盒体手柄", _showSceneHandles);
+                EditorGUILayout.BeginHorizontal();
+                if (GUILayout.Button("+ 排除盒 (红)")) AddVolumeInSceneView(0);
+                if (GUILayout.Button("+ 封闭盒 (青)")) AddVolumeInSceneView(1);
+                if (GUILayout.Button("+ 补丁盒 (绿)")) AddVolumeInSceneView(2);
+                EditorGUILayout.EndHorizontal();
+                EditorGUILayout.LabelField(
+                    $"当前: 排除区 {_settings.ExclusionVolumes.Count} | 封闭区 {_settings.SealVolumes.Count} | 补丁盒 {_settings.PatchBoxes.Count}",
+                    EditorStyles.miniLabel);
+            }
+
+            EditorGUILayout.Space(4);
             _buildLevel = EditorGUILayout.Toggle("烘焙后装配 SplatLevel", _buildLevel);
             using (new EditorGUI.DisabledScope(!_buildLevel))
             {
@@ -66,6 +86,93 @@ namespace Splat2Play.Editor
 
             if (!string.IsNullOrEmpty(_lastLog))
                 EditorGUILayout.HelpBox(_lastLog, MessageType.None);
+        }
+
+        void AddVolumeInSceneView(int kind)
+        {
+            if (_settings == null) return;
+            Undo.RecordObject(_settings, "Add Splat2Play Volume");
+            Vector3 center = Vector3.zero;
+            if (SceneView.lastActiveSceneView != null && SceneView.lastActiveSceneView.camera != null)
+            {
+                var camT = SceneView.lastActiveSceneView.camera.transform;
+                center = camT.position + camT.forward * 3f;
+                if (_targetRenderer != null)
+                    center = _targetRenderer.transform.InverseTransformPoint(center);
+            }
+            if (kind == 0) _settings.ExclusionVolumes.Add(new Bounds(center, Vector3.one * 2f));
+            else if (kind == 1) _settings.SealVolumes.Add(new Bounds(center, new Vector3(1.5f, 2.2f, 0.4f)));
+            else _settings.PatchBoxes.Add(new ProxyBakeSettings.PatchBox { Center = center, Size = new Vector3(2f, 0.2f, 2f), RotationEuler = Vector3.zero });
+            EditorUtility.SetDirty(_settings);
+            SceneView.RepaintAll();
+        }
+
+        void OnSceneGUI(SceneView sv)
+        {
+            if (!_showSceneHandles || _settings == null) return;
+            Matrix4x4 localToWorld = _targetRenderer != null ? _targetRenderer.transform.localToWorldMatrix : Matrix4x4.identity;
+            using (new Handles.DrawingScope(localToWorld))
+            {
+                // 1. ExclusionVolumes (红色)
+                Handles.color = new Color(1f, 0.25f, 0.25f, 0.9f);
+                for (int i = 0; i < _settings.ExclusionVolumes.Count; ++i)
+                {
+                    Bounds b = _settings.ExclusionVolumes[i];
+                    Handles.DrawWireCube(b.center, b.size);
+                    Handles.Label(b.center + Vector3.up * (b.extents.y + 0.1f), $"Exclude[{i}]");
+                    EditorGUI.BeginChangeCheck();
+                    Vector3 newCenter = Handles.PositionHandle(b.center, Quaternion.identity);
+                    Vector3 newSize = Handles.ScaleHandle(b.size, newCenter, Quaternion.identity, HandleUtility.GetHandleSize(newCenter) * 0.8f);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(_settings, "Edit Exclusion Volume");
+                        _settings.ExclusionVolumes[i] = new Bounds(newCenter, Vector3.Max(newSize, Vector3.one * 0.05f));
+                        EditorUtility.SetDirty(_settings);
+                    }
+                }
+
+                // 2. SealVolumes (青色)
+                Handles.color = new Color(0.2f, 0.9f, 1f, 0.9f);
+                for (int i = 0; i < _settings.SealVolumes.Count; ++i)
+                {
+                    Bounds b = _settings.SealVolumes[i];
+                    Handles.DrawWireCube(b.center, b.size);
+                    Handles.Label(b.center + Vector3.up * (b.extents.y + 0.1f), $"Seal[{i}]");
+                    EditorGUI.BeginChangeCheck();
+                    Vector3 newCenter = Handles.PositionHandle(b.center, Quaternion.identity);
+                    Vector3 newSize = Handles.ScaleHandle(b.size, newCenter, Quaternion.identity, HandleUtility.GetHandleSize(newCenter) * 0.8f);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(_settings, "Edit Seal Volume");
+                        _settings.SealVolumes[i] = new Bounds(newCenter, Vector3.Max(newSize, Vector3.one * 0.05f));
+                        EditorUtility.SetDirty(_settings);
+                    }
+                }
+
+                // 3. PatchBoxes (绿色)
+                Handles.color = new Color(0.2f, 1f, 0.4f, 0.9f);
+                for (int i = 0; i < _settings.PatchBoxes.Count; ++i)
+                {
+                    ProxyBakeSettings.PatchBox p = _settings.PatchBoxes[i];
+                    Quaternion rot = Quaternion.Euler(p.RotationEuler);
+                    using (new Handles.DrawingScope(localToWorld * Matrix4x4.TRS(p.Center, rot, Vector3.one)))
+                    {
+                        Handles.DrawWireCube(Vector3.zero, p.Size);
+                    }
+                    Handles.Label(p.Center + Vector3.up * (p.Size.y * 0.5f + 0.1f), $"Patch[{i}]");
+                    EditorGUI.BeginChangeCheck();
+                    Vector3 newCenter = Handles.PositionHandle(p.Center, rot);
+                    Vector3 newSize = Handles.ScaleHandle(p.Size, newCenter, rot, HandleUtility.GetHandleSize(newCenter) * 0.8f);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(_settings, "Edit PatchBox");
+                        p.Center = newCenter;
+                        p.Size = Vector3.Max(newSize, Vector3.one * 0.05f);
+                        _settings.PatchBoxes[i] = p;
+                        EditorUtility.SetDirty(_settings);
+                    }
+                }
+            }
         }
 
         bool CanBake =>
@@ -88,6 +195,11 @@ namespace Splat2Play.Editor
                 AssetDatabase.CreateAsset(proxy, assetPath);
                 AssetDatabase.AddObjectToAsset(result.Mesh, proxy);
                 proxy.CollisionMesh = result.Mesh;
+                if (result.NavigationMesh != null)
+                {
+                    AssetDatabase.AddObjectToAsset(result.NavigationMesh, proxy);
+                    proxy.NavigationMesh = result.NavigationMesh;
+                }
                 proxy.SceneBounds = result.SceneBounds;
                 proxy.SourceSplatCount = result.SplatCount;
                 proxy.TriangleCount = result.TriangleCount;
@@ -95,6 +207,8 @@ namespace Splat2Play.Editor
                 proxy.DensityThreshold = result.DensityThreshold;
                 proxy.Settings = _settings;
                 proxy.PatchBoxes = new(_settings.PatchBoxes);
+                proxy.ChunkBounds = result.ChunkBounds != null ? new(result.ChunkBounds) : new();
+                proxy.ChunkSplatCounts = result.ChunkSplatCounts != null ? new(result.ChunkSplatCounts) : new();
                 proxy.BakeLog = result.Log;
                 EditorUtility.SetDirty(proxy);
                 AssetDatabase.SaveAssets();
@@ -126,7 +240,15 @@ namespace Splat2Play.Editor
                         var surface = go.GetComponent<NavMeshSurface>() ?? go.AddComponent<NavMeshSurface>();
                         surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
                         surface.collectObjects = CollectObjects.Children;
-                        surface.BuildNavMesh();
+                        level.SwapToNavigationMesh(true);
+                        try
+                        {
+                            surface.BuildNavMesh();
+                        }
+                        finally
+                        {
+                            level.SwapToNavigationMesh(false);
+                        }
                     }
 
                     Undo.RegisterCreatedObjectUndo(go, "Splat2Play Bake Level");

@@ -20,14 +20,22 @@ namespace Splat2Play.Runtime
         public float OpacityWeight = 1.0f;
         [Tooltip("包围盒百分位(0–10):逐轴取 [p,100-p] 分位,剔除天空等远距离离群 splat。0 = 用绝对 min/max。")]
         [Range(0f, 10f)] public float BoundsPercentile = 1f;
+        [Tooltip("场景 AABB 外扩边距(米,§5.1 boundsMargin)。")]
+        [Range(0f, 5f)] public float BoundsMargin = 0.5f;
 
-        [Header("填充与封闭")]
-        [Tooltip("洪泛填充封闭内部(把扫描漏洞里的空腔标记为实心)。")]
+        [Header("填充与 SDF 平滑")]
+        [Tooltip("洪泛填充封闭内部(把扫描漏洞里的空腔标记为实心;室内房间关卡建议设为 false)。")]
         public bool FillInterior = true;
+        [Tooltip("启用 3D 有向距离场(SDF)平滑核,使提取出的等值面网格更平滑(512 档自动关闭以控制内存)。")]
+        public bool UseSDF = true;
 
-        [Header("网格")]
-        [Tooltip("代理网格三角形上限,超出则自动加倍顶点聚类粒度。")]
+        [Header("网格与导航")]
+        [Tooltip("代理碰撞网格三角形上限,超出则自动加倍顶点聚类粒度。")]
         public int MaxTriangles = 150000;
+        [Tooltip("同时生成供 M2 NavMesh 烘焙使用的简化平滑寻路网格(§5.2 碰撞细网格/寻路粗网格分离)。")]
+        public bool BakeNavigationMesh = true;
+        [Tooltip("寻路专用粗网格三角形上限。")]
+        public int MaxNavTriangles = 40000;
 
         [Header("边界情况(T1.7)")]
         [Tooltip("排除区:处于这些 AABB 内的 splat 不参与体素化(剔除漂浮噪点)。")]
@@ -48,7 +56,14 @@ namespace Splat2Play.Runtime
         void OnValidate()
         {
             VoxelResolution = Mathf.Clamp(VoxelResolution, 64, 512);
+            if (VoxelResolution >= 512 && UseSDF)
+            {
+                UseSDF = false;
+                Debug.LogWarning("[Splat2Play] 512³ 分辨率下为控制内存峰值(<2GB),已自动关闭 UseSDF(§5.1 规格)。");
+            }
+            BoundsMargin = Mathf.Clamp(BoundsMargin, 0f, 5f);
             MaxTriangles = Mathf.Max(1000, MaxTriangles);
+            MaxNavTriangles = Mathf.Clamp(MaxNavTriangles, 500, MaxTriangles);
         }
     }
 
@@ -58,6 +73,8 @@ namespace Splat2Play.Runtime
     {
         [Tooltip("代理碰撞网格。只读使用;由烘焙生成。")]
         public Mesh CollisionMesh;
+        [Tooltip("寻路专用简化网格(M2 NavMesh 优先使用;为空时回退使用 CollisionMesh)。")]
+        public Mesh NavigationMesh;
         public Bounds SceneBounds;
         public int SourceSplatCount;
         public int TriangleCount;
@@ -66,6 +83,10 @@ namespace Splat2Play.Runtime
         public ProxyBakeSettings Settings;
         [Tooltip("补丁盒体(场景局部坐标),由 SplatLevel 实例化为 BoxCollider。")]
         public List<ProxyBakeSettings.PatchBox> PatchBoxes = new();
+        [Tooltip("M4 分块剔除:非空空间子块 AABB 列表(局部坐标)。")]
+        public List<Bounds> ChunkBounds = new();
+        [Tooltip("M4 分块剔除:对应每个非空子块内的 splat 数量。")]
+        public List<int> ChunkSplatCounts = new();
         [Tooltip("烘焙统计与决策记录(供 benchmarks 汇总)。")]
         [TextArea(3, 8)] public string BakeLog;
     }
