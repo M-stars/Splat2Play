@@ -83,6 +83,70 @@ namespace Splat2Play.Runtime
             return ReadAll(fs, out splatCount, out kind, out sourceBytes);
         }
 
+        /// <summary>
+        /// M8:读取全部 splat(含 f_dc 基色 SH0 系数),供动态物体剥离与底面修补往返 PLY。
+        /// PLY 直接读 f_dc;SPZ 由颜色流解码:fdc = SH0ToColor⁻¹((c/255-0.5)/0.15 过 SH0)。
+        /// </summary>
+        public static NativeArray<SplatRawX> ReadAllX(Stream stream, out int splatCount,
+                                                      out SplatSourceKind kind, out long sourceBytes)
+        {
+            kind = DetectKind(stream);
+            switch (kind)
+            {
+                case SplatSourceKind.Ply:
+                {
+                    var header = PlySplatReader.ReadHeader(stream);
+                    if (header.SplatCount == 0) throw new InvalidDataException("PLY 中没有 splat");
+                    splatCount = header.SplatCount;
+                    var splats = PlySplatReader.ReadSplatsX(stream, header, out long vertexBytes);
+                    sourceBytes = vertexBytes;
+                    return splats;
+                }
+                case SplatSourceKind.Spz:
+                {
+                    using var spz = GaussianSplatRawExtractor.Read(stream);
+                    if (spz.SplatCount == 0) throw new InvalidDataException("SPZ 中没有 splat");
+                    splatCount = spz.SplatCount;
+                    sourceBytes = spz.Data.Length;
+                    return DecodeSpzToSplatRawX(spz);
+                }
+                default:
+                    throw new InvalidDataException("无法识别的扫描资产格式(期望 binary PLY 或 SPZ)");
+            }
+        }
+
+        /// <summary>便捷入口(文件路径版,含颜色)。</summary>
+        public static NativeArray<SplatRawX> ReadAllX(string path, out int splatCount,
+                                                      out SplatSourceKind kind, out long sourceBytes)
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
+            return ReadAllX(fs, out splatCount, out kind, out sourceBytes);
+        }
+
+        /// <summary>SPZ 解压属性流 → SplatRawX(含 f_dc 基色,Burst 并行,确定性)。</summary>
+        static NativeArray<SplatRawX> DecodeSpzToSplatRawX(in SpzRawData spz)
+        {
+            var result = new NativeArray<SplatRawX>(spz.SplatCount, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            bool ok = false;
+            try
+            {
+                new SpzToSplatRawXJob
+                {
+                    Input = spz.Data,
+                    SplatCount = spz.SplatCount,
+                    Version = spz.Version,
+                    FractionalBits = spz.FractionalBits,
+                    Out = result
+                }.Schedule(spz.SplatCount, 4096).Complete();
+                ok = true;
+                return result;
+            }
+            finally
+            {
+                if (!ok) result.Dispose();
+            }
+        }
+
         /// <summary>SPZ 解压属性流 → SplatRaw(Burst 并行,确定性)。</summary>
         static NativeArray<SplatRaw> DecodeSpzToSplatRaw(in SpzRawData spz)
         {
@@ -199,5 +263,92 @@ namespace Splat2Play.Runtime
             }
         }
 
+        /// <summary>带 f_dc 基色的 SPZ 解码(M8):布局与 SpzToSplatRawJob 一致,另解颜色流。</summary>
+        [BurstCompile(FloatMode = FloatMode.Fast)]
+        unsafe struct SpzToSplatRawXJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<byte> Input;
+            public int SplatCount;
+            public int Version;
+            public int FractionalBits;
+            [NativeDisableParallelForRestriction] public NativeArray<SplatRawX> Out;
+
+            public void Execute(int i)
+            {
+                int positionBytes = Version == 1 ? 6 : 9;
+                byte* basePtr = (byte*)Input.GetUnsafeReadOnlyPtr();
+
+                byte* p = basePtr + i * positionBytes;
+                float3 position;
+                if (Version == 1)
+                {
+                    position = new float3(
+                        math.f16tof32(*(ushort*)p),
+                        math.f16tof32(*(ushort*)(p + 2)),
+                        math.f16tof32(*(ushort*)(p + 4)));
+                }
+                else
+                {
+                    float fraction = math.rcp(1 << FractionalBits);
+                    position = new float3(Fixed24(p, fraction), Fixed24(p + 3, fraction), Fixed24(p + 6, fraction));
+                }
+
+                byte* alpha = basePtr + (long)SplatCount * positionBytes;
+                float opacity = alpha[i] / 255f;
+
+                // 颜色流:c ∈ [0,255] → ((c/255-0.5)/0.15) 过 SH0(×0.2820948+0.5)——此处保留
+                // SH0 系数形式(f_dc),与 PLY 的 f_dc 语义一致供往返写盘
+                byte* col = alpha + (long)SplatCount + i * 3;
+                float3 fdc = ((new float3(col[0], col[1], col[2]) / 255f - 0.5f) / 0.15f);
+
+                byte* scl = alpha + (long)SplatCount * 4 + i * 3;
+                float3 scale = math.exp(new float3(scl[0], scl[1], scl[2]) / 16f - 10f);
+
+                int rotationBytes = Version < 3 ? 3 : 4;
+                byte* rot = alpha + (long)SplatCount * 7 + i * rotationBytes;
+                float4 rotation = float4.zero;
+                if (Version < 3)
+                {
+                    rotation.xyz = new float3(rot[0], rot[1], rot[2]) / 127.5f - 1f;
+                    rotation.w = math.sqrt(math.max(0f, 1f - math.lengthsq(rotation.xyz)));
+                }
+                else
+                {
+                    uint packed = rot[0] | ((uint)rot[1] << 8) | ((uint)rot[2] << 16) | ((uint)rot[3] << 24);
+                    rotation = DecodeSmallestThree(packed);
+                }
+                float len = math.length(rotation);
+                rotation = len > 1e-8f ? rotation / len : new float4(0f, 0f, 0f, 1f);
+
+                Out[i] = new SplatRawX
+                {
+                    Position = position,
+                    Scale = scale,
+                    Rotation = rotation,
+                    Opacity = opacity,
+                    Fdc = fdc
+                };
+            }
+
+            static float Fixed24(byte* p, float scale)
+            {
+                int v = p[0] | (p[1] << 8) | (p[2] << 16);
+                return ((v << 8) >> 8) * scale;
+            }
+
+            static float4 DecodeSmallestThree(uint packed)
+            {
+                uint index = packed >> 30;
+                uint3 components = new uint3(packed >> 20, packed >> 10, packed) & 1023;
+                float4 q = float4.zero;
+                q.xyz = (float3)(components & 511) * (0.7071067811865475f / 511f);
+                q.xyz *= math.select(new float3(1f), new float3(-1f), (components & 512) != 0);
+                q.w = math.sqrt(math.max(0f, 1f - math.dot(q.xyz, q.xyz)));
+                if (index == 0) q = q.wxyz;
+                if (index == 1) q = q.xwyz;
+                if (index == 2) q = q.xywz;
+                return q;
+            }
+        }
     }
 }

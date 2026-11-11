@@ -62,12 +62,38 @@ namespace Splat2Play.Runtime
         [Tooltip("补丁盒体:不参与体素化,直接作为额外 BoxCollider 追加(细长结构兜底)。")]
         public List<PatchBox> PatchBoxes = new();
 
+        [Header("M8 动态物体(T8.1)")]
+        [Tooltip("动态物体盒体:中心落在盒内的 splat 会被剥离为独立可交互刚体(可破坏物件)。")]
+        public List<DynamicPropVolume> DynamicProps = new();
+
         [Serializable]
         public struct PatchBox
         {
             public Vector3 Center;
             public Vector3 Size;
             public Vector3 RotationEuler;
+        }
+
+        /// <summary>M8 T8.1:SceneView 框选的动态物体切割盒(椅子/箱子/花瓶等独立物件)。</summary>
+        [Serializable]
+        public struct DynamicPropVolume
+        {
+            [Tooltip("物件名称(用于生成子资产与 GameObject)")]
+            public string PropName;
+            [Tooltip("扫描资产局部空间中的切割盒体")]
+            public Bounds Volume;
+            [Tooltip("生成的刚体质量(kg)")]
+            public float Mass;
+            [Tooltip("是否可被击碎(预留:当前仅施力推倒)")]
+            public bool Destructible;
+
+            public static DynamicPropVolume Default(string name) => new DynamicPropVolume
+            {
+                PropName = name,
+                Volume = new Bounds(Vector3.zero, Vector3.one),
+                Mass = 5f,
+                Destructible = false
+            };
         }
 
         void OnValidate()

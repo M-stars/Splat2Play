@@ -834,5 +834,125 @@ namespace Splat2Play.Tests
             Assert.That(normal.y, Is.EqualTo(-1f).Within(1e-5), "从下方观察法线应翻转朝下");
         }
 
+        // ==================== M8(方向 3):动态物体剥离与底面修补 ====================
+
+        [Test]
+        public void PropExtractor_SplitsBackgroundAndProp_AndInpaintsFloor()
+        {
+            // 合成场景:地面网格(y=0)+ 盒状箱子(y∈[0.15,0.4])+ 包围箱子的切割盒
+            var ground = new System.Collections.Generic.List<SplatRawX>();
+            for (int z = 0; z < 13; ++z)
+            for (int x = 0; x < 13; ++x)
+            {
+                ground.Add(MakeX(new float3(-0.6f + x * 0.1f, 0f, -0.6f + z * 0.1f), 0.05f,
+                    new float3(0.35f, 0.36f, 0.34f)));
+            }
+            int groundCount = ground.Count;
+            var box = new System.Collections.Generic.List<SplatRawX>();
+            for (int z = 0; z < 5; ++z)
+            for (int y = 0; y < 5; ++y)
+            for (int x = 0; x < 5; ++x)
+            {
+                box.Add(MakeX(new float3(-0.16f + x * 0.08f, 0.15f + y * 0.06f, -0.16f + z * 0.08f), 0.02f,
+                    new float3(0.6f, 0.3f, 0.2f)));
+            }
+            int boxCount = box.Count;
+            ground.AddRange(box);
+
+            var splats = new NativeArray<SplatRawX>(ground.ToArray(), Allocator.TempJob);
+            var settings = ScriptableObject.CreateInstance<ProxyBakeSettings>();
+            settings.DynamicProps.Add(new ProxyBakeSettings.DynamicPropVolume
+            {
+                PropName = "Crate",
+                Volume = new Bounds(new Vector3(0f, 0.3f, 0f), new Vector3(0.5f, 0.55f, 0.5f)),
+                Mass = 8f,
+                Destructible = false
+            });
+            try
+            {
+                using var extraction = SplatPropExtractor.Extract(splats, settings);
+                Assert.AreEqual(1, extraction.Props.Length, "应分离出 1 个动态物体");
+
+                // 子物体:全部箱子点、局部居中(质心在原点)
+                var prop = extraction.Props[0];
+                Assert.AreEqual(boxCount, prop.Length, "子物体应包含箱子全部 splat");
+                float3 propMean = 0;
+                for (int i = 0; i < prop.Length; ++i)
+                {
+                    propMean += prop[i].Position;
+                    Assert.That(math.cmax(math.abs(prop[i].Position)), Is.LessThan(0.25f), "子物体应局部居中");
+                }
+                propMean /= prop.Length;
+                Assert.That(math.cmax(math.abs(propMean)), Is.LessThan(0.02f), $"质心应在原点,实际 {propMean}");
+
+                // 背景:仅剩地面(箱子内部已被清空)
+                var bg = extraction.Background;
+                Assert.AreEqual(groundCount, bg.Length, "背景应仅剩地面 splat");
+                for (int i = 0; i < bg.Length; ++i)
+                    Assert.That(bg[i].Position.y, Is.LessThan(0.05f), "背景不应包含切割盒内的箱子 splat");
+
+                // 底面修补:环形框(地面围绕箱子)统计 → 盒底足迹内铺设修补高斯
+                var inpainted = SplatPropExtractor.InpaintFloors(bg, settings);
+                using (inpainted)
+                {
+                    Assert.Greater(inpainted.Length, bg.Length, "应生成修补高斯");
+                    int added = 0;
+                    float addedMeanY = 0;
+                    for (int i = bg.Length; i < inpainted.Length; ++i)
+                    {
+                        SplatRawX s = inpainted[i];
+                        added++;
+                        addedMeanY += s.Position.y;
+                        Assert.That(s.Position.y, Is.InRange(-0.05f, 0.05f), "修补层应贴合地面高度(y≈0)");
+                        Assert.That(math.abs(s.Position.x), Is.LessThanOrEqualTo(0.26f), "修补层应在盒底足迹内");
+                        Assert.That(math.abs(s.Position.z), Is.LessThanOrEqualTo(0.26f), "修补层应在盒底足迹内");
+                        Assert.That(s.Opacity, Is.EqualTo(SplatPropExtractor.kInpaintOpacity).Within(1e-5), "修补高斯不透明度应为 0.95");
+                        Assert.That(s.Scale.y, Is.EqualTo(0.01f).Within(1e-5), "修补高斯应为扁平圆盘");
+                    }
+                    addedMeanY /= math.max(1, added);
+                    Assert.That(math.abs(addedMeanY), Is.LessThan(0.02f), $"修补层平均高度应 ≈ 0,实际 {addedMeanY:F4}");
+
+                    // PLY 往返:写出后重读,物理量一致
+                    string path = Path.Combine(Path.GetTempPath(), $"s2p_test_prop_{System.Guid.NewGuid():N}.ply");
+                    try
+                    {
+                        SplatPropExtractor.WriteBinaryPly(path, prop);
+                        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+                        var header = PlySplatReader.ReadHeader(fs);
+                        using var reloaded = PlySplatReader.ReadSplatsX(fs, header, out _);
+                        Assert.AreEqual(prop.Length, reloaded.Length, "PLY 往返 splat 数一致");
+                        for (int i = 0; i < prop.Length; ++i)
+                        {
+                            Assert.That(reloaded[i].Position.x, Is.EqualTo(prop[i].Position.x).Within(1e-5));
+                            Assert.That(reloaded[i].Opacity, Is.EqualTo(prop[i].Opacity).Within(1e-3), "opacity 应经 sigmoid/logit 往返还原");
+                            Assert.That(reloaded[i].Scale.x, Is.EqualTo(prop[i].Scale.x).Within(1e-4), "scale 应经 exp/log 往返还原");
+                            Assert.That(reloaded[i].Fdc.x, Is.EqualTo(prop[i].Fdc.x).Within(1e-5), "f_dc 往返一致");
+                            Assert.That(reloaded[i].Rotation.w, Is.EqualTo(prop[i].Rotation.w).Within(1e-4), "四元数往返一致(rot_0=w)");
+                        }
+                    }
+                    finally
+                    {
+                        if (File.Exists(path)) File.Delete(path);
+                    }
+                }
+            }
+            finally
+            {
+                splats.Dispose();
+                UnityEngine.Object.DestroyImmediate(settings);
+            }
+        }
+
+        static SplatRawX MakeX(float3 pos, float scale, float3 fdc)
+        {
+            return new SplatRawX
+            {
+                Position = pos,
+                Scale = new float3(scale),
+                Rotation = new float4(0f, 0f, 0f, 1f),
+                Opacity = 1f,
+                Fdc = fdc
+            };
+        }
     }
 }

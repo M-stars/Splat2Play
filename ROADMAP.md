@@ -64,6 +64,14 @@
 - 与 M3 解耦:主手电筒保留屏幕空间真实阴影;附加灯提供"逐高斯"与"逐像素回退"互斥双路径(避免双重光照)
 - **退出标准:** 扁平圆盘→(0,1,0)/flatness>0.95、球状→flatness=0、旋转对齐、双面翻转 ✅(单元测试 4 项全绿)
 
+### M8 — 可交互/可破坏 3DGS 动态刚体剥离(方向 3)✅ 2026-11-12
+
+- SceneView 黄色手柄框选 `DynamicPropVolume`(名称/质量/可破坏);向导一键"分离动态物体 (Extract Dynamic Props)"
+- `SplatPropExtractor`:盒内 splat 剥离为独立 PLY(质心居中)+ 64³ 凸包 `MeshCollider` + `Rigidbody` + `NavMeshObstacle(carving)`
+- 底面邻域高斯修补(Floor Inpainting):环形采样框统计(±0.08m 切片 / 0.20m 环带)→ 盒底铺设扁平修补高斯(α=0.95,±3% 确定性扰动)
+- `SplatFPSController` 交互:左键射击冲量(`AddForceAtPosition`)、E 键抓取/投掷;被推倒物件经 NavMeshObstacle 令 `EnemyChaser` 自动绕行
+- **退出标准:** 分离/修补/PLY 往返单元测试 ✅;运行时射击-翻滚-阴影-绕行(无头验证,见 benchmarks)
+
 ## 性能基准目标(桌面,RTX 级显卡)
 
 - ≥100 万 splat 场景,开启代理 + 近似光照后仍达 60fps

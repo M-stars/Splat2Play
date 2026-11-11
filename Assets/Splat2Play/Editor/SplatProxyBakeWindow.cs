@@ -23,6 +23,7 @@ namespace Splat2Play.Editor
         bool _buildLevel = true;
         bool _bakeNavMesh = true;
         bool _showSceneHandles = true;
+        bool _replaceBackground = true;
         string _lastLog;
 
         void OnEnable() => SceneView.duringSceneGui += OnSceneGUI;
@@ -67,8 +68,17 @@ namespace Splat2Play.Editor
                 if (GUILayout.Button("+ 封闭盒 (青)")) AddVolumeInSceneView(1);
                 if (GUILayout.Button("+ 补丁盒 (绿)")) AddVolumeInSceneView(2);
                 EditorGUILayout.EndHorizontal();
+                EditorGUILayout.BeginHorizontal();
+                if (GUILayout.Button("+ 动态物体盒 (黄)")) AddVolumeInSceneView(3);
+                using (new EditorGUI.DisabledScope(!CanBake || _settings.DynamicProps.Count == 0))
+                {
+                    if (GUILayout.Button("分离动态物体 (Extract Dynamic Props)", GUILayout.Height(24)))
+                        ExtractDynamicProps();
+                }
+                EditorGUILayout.EndHorizontal();
+                _replaceBackground = EditorGUILayout.Toggle("分离后替换主背景为修补 PLY", _replaceBackground);
                 EditorGUILayout.LabelField(
-                    $"当前: 排除区 {_settings.ExclusionVolumes.Count} | 封闭区 {_settings.SealVolumes.Count} | 补丁盒 {_settings.PatchBoxes.Count}",
+                    $"当前: 排除区 {_settings.ExclusionVolumes.Count} | 封闭区 {_settings.SealVolumes.Count} | 补丁盒 {_settings.PatchBoxes.Count} | 动态物体 {_settings.DynamicProps.Count}",
                     EditorStyles.miniLabel);
             }
 
@@ -104,6 +114,13 @@ namespace Splat2Play.Editor
             if (kind == 0) _settings.ExclusionVolumes.Add(new Bounds(center, Vector3.one * 2f));
             else if (kind == 1) _settings.SealVolumes.Add(new Bounds(center, new Vector3(1.5f, 2.2f, 0.4f)));
             else if (kind == 2) _settings.PatchBoxes.Add(new ProxyBakeSettings.PatchBox { Center = center, Size = new Vector3(2f, 0.2f, 2f), RotationEuler = Vector3.zero });
+            else _settings.DynamicProps.Add(new ProxyBakeSettings.DynamicPropVolume
+            {
+                PropName = $"Prop{_settings.DynamicProps.Count}",
+                Volume = new Bounds(center, new Vector3(0.8f, 1.2f, 0.8f)),
+                Mass = 5f,
+                Destructible = false
+            });
             EditorUtility.SetDirty(_settings);
             SceneView.RepaintAll();
         }
@@ -174,12 +191,140 @@ namespace Splat2Play.Editor
                     }
                 }
 
+                // 4. DynamicProps (黄色,M8 动态物体切割盒)
+                Handles.color = new Color(1f, 0.85f, 0.1f, 0.95f);
+                for (int i = 0; i < _settings.DynamicProps.Count; ++i)
+                {
+                    var dp = _settings.DynamicProps[i];
+                    Bounds b = dp.Volume;
+                    Handles.DrawWireCube(b.center, b.size);
+                    Handles.Label(b.center + Vector3.up * (b.extents.y + 0.1f), $"Prop[{i}] {dp.PropName} ({dp.Mass:F1}kg)");
+                    EditorGUI.BeginChangeCheck();
+                    Vector3 newCenter = Handles.PositionHandle(b.center, Quaternion.identity);
+                    Vector3 newSize = Handles.ScaleHandle(b.size, newCenter, Quaternion.identity, HandleUtility.GetHandleSize(newCenter) * 0.8f);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(_settings, "Edit Dynamic Prop Volume");
+                        dp.Volume = new Bounds(newCenter, Vector3.Max(newSize, Vector3.one * 0.05f));
+                        _settings.DynamicProps[i] = dp;
+                        EditorUtility.SetDirty(_settings);
+                    }
+                }
             }
         }
 
         bool CanBake =>
             !string.IsNullOrWhiteSpace(_plyPath) && File.Exists(_plyPath)
             && _settings != null;
+
+        /// <summary>
+        /// M8 T8.2:分离动态物体 —— 剥离盒内 splat 为独立 PLY(局部居中)+ 自动 64³ 凸包碰撞体
+        /// + Rigidbody/NavMeshObstacle 装配;主背景执行底面修补并(可选)替换渲染路径。
+        /// </summary>
+        void ExtractDynamicProps()
+        {
+            try
+            {
+                EditorUtility.DisplayProgressBar("Splat2Play", "读取扫描资产…", 0.05f);
+                var splats = SplatSourceReader.ReadAllX(_plyPath, out int splatCount, out _, out _);
+                try
+                {
+                    EditorUtility.DisplayProgressBar("Splat2Play", "分离动态物体…", 0.3f);
+                    using var extraction = SplatPropExtractor.Extract(splats, _settings);
+                    using var inpainted = SplatPropExtractor.InpaintFloors(extraction.Background, _settings);
+
+                    string root = Path.GetDirectoryName(Application.dataPath);
+                    string scansDir = Path.Combine(root, "Assets", "StreamingAssets", "scans");
+                    string propsDir = Path.Combine(scansDir, "props");
+                    Directory.CreateDirectory(propsDir);
+                    string baseName = Path.GetFileNameWithoutExtension(_plyPath);
+
+                    EditorUtility.DisplayProgressBar("Splat2Play", "写出修补后背景 PLY…", 0.5f);
+                    string bgPath = Path.Combine(scansDir, $"{baseName}_background.ply");
+                    SplatPropExtractor.WriteBinaryPly(bgPath, inpainted);
+
+                    var log = new System.Text.StringBuilder();
+                    log.AppendLine($"[M8] 背景 {inpainted.Length:N0} splats → {bgPath}");
+
+                    var propSettings = ScriptableObject.CreateInstance<ProxyBakeSettings>();
+                    propSettings.VoxelResolution = 64;
+                    propSettings.MaxTriangles = 4000;
+                    propSettings.MaxNavTriangles = 500;
+                    propSettings.BakeNavigationMesh = false;
+                    propSettings.FillInterior = false;
+                    propSettings.UseSDF = false;
+                    propSettings.BoundsPercentile = 0f;
+                    propSettings.BoundsMargin = 0.05f;
+                    try
+                    {
+                        for (int v = 0; v < extraction.Props.Length; ++v)
+                        {
+                            if (extraction.Props[v].Length == 0) continue;
+                            float progress = 0.55f + 0.4f * v / extraction.Props.Length;
+                            EditorUtility.DisplayProgressBar("Splat2Play", $"烘焙动态物体 {extraction.PropNames[v]}…", progress);
+
+                            string propPath = Path.Combine(propsDir, $"{baseName}_{extraction.PropNames[v]}.ply");
+                            SplatPropExtractor.WriteBinaryPly(propPath, extraction.Props[v]);
+
+                            // 64³ 快速烘焙凸包碰撞网格(<50ms 量级)
+                            using var bake = SplatProxyBaker.Bake(propPath, propSettings);
+                            var mesh = bake.Mesh;
+                            mesh.name = $"S2P_Prop_{extraction.PropNames[v]}_Collision";
+
+                            // 装配子物体:渲染器 + 凸包碰撞 + 刚体 + NavMeshObstacle
+                            Transform parent = _targetRenderer != null ? _targetRenderer.transform.parent : null;
+                            var go = new GameObject($"S2P_Prop_{extraction.PropNames[v]}");
+                            if (parent != null) Undo.SetTransformParent(go.transform, parent, "Splat2Play Extract Prop");
+                            go.transform.localPosition = (Vector3)extraction.PropCentroids[v];
+                            go.transform.localRotation = Quaternion.identity;
+
+                            var renderer = go.AddComponent<GaussianSplatRenderer>();
+                            renderer.m_SourcePath = propPath; // ResolvePath 支持绝对路径
+                            renderer.m_MortonReorder = true;
+
+                            var mc = go.AddComponent<MeshCollider>();
+                            mc.sharedMesh = mesh;
+                            mc.convex = true;
+
+                            var prop = go.AddComponent<S2PDynamicProp>();
+                            prop.SplatRenderer = renderer;
+                            prop.Mass = _settings.DynamicProps[v].Mass;
+                            prop.Destructible = _settings.DynamicProps[v].Destructible;
+
+                            log.AppendLine($"[M8] 物体 {extraction.PropNames[v]}: {extraction.Props[v].Length:N0} splats, 质心 {(Vector3)extraction.PropCentroids[v]:F2}, 碰撞 {bake.TriangleCount:N0} 面");
+                        }
+
+                        if (_replaceBackground && _targetRenderer != null)
+                        {
+                            Undo.RecordObject(_targetRenderer, "Splat2Play Replace Background");
+                            _targetRenderer.m_SourcePath = bgPath;
+                            _targetRenderer.Reload(); // 重载修补后的背景
+                            log.AppendLine("[M8] 主背景已切换为修补后 PLY 并重载");
+                        }
+
+                        AssetDatabase.Refresh();
+                        _lastLog = log.ToString();
+                    }
+                    finally
+                    {
+                        UnityEngine.Object.DestroyImmediate(propSettings);
+                    }
+                }
+                finally
+                {
+                    splats.Dispose();
+                }
+            }
+            catch (System.Exception e)
+            {
+                _lastLog = $"分离失败:{e.Message}";
+                Debug.LogException(e);
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+        }
 
         void Bake()
         {

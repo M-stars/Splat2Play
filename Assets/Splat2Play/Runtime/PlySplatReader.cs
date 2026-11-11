@@ -24,6 +24,16 @@ namespace Splat2Play.Runtime
         public float Opacity;     // sigmoid(raw)
     }
 
+    /// <summary>M8:带基色 SH0 系数(f_dc)的扩展 splat(供动态物体剥离与底面修补往返 PLY)。</summary>
+    public struct SplatRawX
+    {
+        public float3 Position;
+        public float3 Scale;
+        public float4 Rotation;   // xyzw
+        public float Opacity;
+        public float3 Fdc;        // f_dc_0..2(基色 SH0 系数)
+    }
+
     /// <summary>
     /// 解析 binary_little_endian 3DGS PLY。
     /// 与 INRIA/nerfstudio 输出兼容:必需属性 x/y/z, scale_0..2, rot_0..3, opacity, f_dc_0..2;
@@ -39,6 +49,7 @@ namespace Splat2Play.Runtime
             public int OffsetScale0, OffsetScale1, OffsetScale2;
             public int OffsetRot0, OffsetRot1, OffsetRot2, OffsetRot3;
             public int OffsetOpacity;
+            public int OffsetFdc0, OffsetFdc1, OffsetFdc2; // M8:基色 SH0 系数
         }
 
         /// <summary>解析头部并校验格式。失败抛异常,消息中文以便定位。</summary>
@@ -100,7 +111,9 @@ namespace Splat2Play.Runtime
             h.OffsetRot0 = offsets[Require("rot_0")]; h.OffsetRot1 = offsets[Require("rot_1")];
             h.OffsetRot2 = offsets[Require("rot_2")]; h.OffsetRot3 = offsets[Require("rot_3")];
             h.OffsetOpacity = offsets[Require("opacity")];
-            if (names.IndexOf("f_dc_0") < 0) throw new InvalidDataException("缺少必需的 PLY 属性: f_dc_0");
+            h.OffsetFdc0 = offsets[Require("f_dc_0")];
+            h.OffsetFdc1 = offsets[Require("f_dc_1")];
+            h.OffsetFdc2 = offsets[Require("f_dc_2")];
             return h;
         }
 
@@ -145,10 +158,51 @@ namespace Splat2Play.Runtime
             }
         }
 
-        /// <summary>快速路径:只提取位置(边界估算等场景)。返回数组由调用方 Dispose。</summary>
-        public static NativeArray<float3> ReadPositions(Stream stream, in PlyHeader header)
+        /// <summary>
+        /// M8:读取全部 splat(含 f_dc 基色)。顶点数据整块读入后由 Burst 并行解包(确定性)。
+        /// 返回的 NativeArray 由调用方负责 Dispose。
+        /// </summary>
+        public static NativeArray<SplatRawX> ReadSplatsX(Stream stream, in PlyHeader header, out long vertexBytes)
         {
             NativeArray<byte> bytes = default;
+            NativeArray<SplatRawX> result = default;
+            bool ok = false;
+            try
+            {
+                long total = (long)header.SplatCount * header.Stride;
+                if (stream.Length - stream.Position < total)
+                    throw new EndOfStreamException("PLY 顶点数据不完整");
+
+                bytes = new NativeArray<byte>((int)total, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                ReadVertexBlock(stream, bytes, total);
+
+                result = new NativeArray<SplatRawX>(header.SplatCount, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                new UnpackXJob
+                {
+                    Bytes = bytes,
+                    Stride = header.Stride,
+                    OffX = header.OffsetX, OffY = header.OffsetY, OffZ = header.OffsetZ,
+                    OffS0 = header.OffsetScale0, OffS1 = header.OffsetScale1, OffS2 = header.OffsetScale2,
+                    OffR0 = header.OffsetRot0, OffR1 = header.OffsetRot1, OffR2 = header.OffsetRot2, OffR3 = header.OffsetRot3,
+                    OffO = header.OffsetOpacity,
+                    OffF0 = header.OffsetFdc0, OffF1 = header.OffsetFdc1, OffF2 = header.OffsetFdc2,
+                    Out = result
+                }.Schedule(header.SplatCount, 4096).Complete();
+
+                vertexBytes = total;
+                ok = true;
+                return result;
+            }
+            finally
+            {
+                if (bytes.IsCreated) bytes.Dispose();
+                if (!ok && result.IsCreated) result.Dispose();
+            }
+        }
+
+        /// <summary>快速路径:只提取位置(边界估算等场景)。返回数组由调用方 Dispose。</summary>
+        public static NativeArray<float3> ReadPositions(Stream stream, in PlyHeader header)
+        {            NativeArray<byte> bytes = default;
             NativeArray<float3> result = default;
             bool ok = false;
             try
@@ -226,9 +280,38 @@ namespace Splat2Play.Runtime
         }
 
         [BurstCompile(FloatMode = FloatMode.Fast)]
-        struct UnpackPositionsJob : IJobParallelFor
+        struct UnpackXJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<byte> Bytes;
+            public int Stride;
+            public int OffX, OffY, OffZ;
+            public int OffS0, OffS1, OffS2;
+            public int OffR0, OffR1, OffR2, OffR3;
+            public int OffO;
+            public int OffF0, OffF1, OffF2;
+            [NativeDisableParallelForRestriction] public NativeArray<SplatRawX> Out;
+
+            public unsafe void Execute(int i)
+            {
+                float* row = (float*)((byte*)Bytes.GetUnsafeReadOnlyPtr() + (long)i * Stride);
+                float3 scale = new(math.exp(row[OffS0 >> 2]), math.exp(row[OffS1 >> 2]), math.exp(row[OffS2 >> 2]));
+                float4 rot = new(row[OffR1 >> 2], row[OffR2 >> 2], row[OffR3 >> 2], row[OffR0 >> 2]); // xyzw
+                float len = math.length(rot);
+                rot = len > 1e-8f ? rot / len : new float4(0f, 0f, 0f, 1f);
+                Out[i] = new SplatRawX
+                {
+                    Position = new float3(row[OffX >> 2], row[OffY >> 2], row[OffZ >> 2]),
+                    Scale = scale,
+                    Rotation = rot,
+                    Opacity = math.rcp(1f + math.exp(-row[OffO >> 2])),
+                    Fdc = new float3(row[OffF0 >> 2], row[OffF1 >> 2], row[OffF2 >> 2])
+                };
+            }
+        }
+
+        [BurstCompile(FloatMode = FloatMode.Fast)]
+        struct UnpackPositionsJob : IJobParallelFor
+        {            [ReadOnly] public NativeArray<byte> Bytes;
             public int Stride;
             public int OffX, OffY, OffZ;
             [NativeDisableParallelForRestriction] public NativeArray<float3> Out;
