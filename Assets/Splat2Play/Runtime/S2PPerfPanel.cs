@@ -3,17 +3,18 @@
 
 using GaussianSplatting.Runtime;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.Profiling;
 
 namespace Splat2Play.Runtime
 {
-    /// <summary>运行时性能面板:splat 数 / fps / 帧耗时 / 内存 / 代理与流送状态。</summary>
+    /// <summary>运行时性能面板:splat 数 / fps / 帧耗时 / 显存估算 / 代理与流送状态(F3 切换显隐)。</summary>
     [DisallowMultipleComponent]
     public sealed class S2PPerfPanel : MonoBehaviour
     {
         public GaussianSplatRenderer SplatRenderer;
         public ProxyData Proxy;
-        public Rect Rect = new(8f, 8f, 300f, 150f);
+        public Rect Rect = new(8f, 8f, 320f, 175f);
         public bool Show = true;
 
         float _fps;
@@ -21,23 +22,44 @@ namespace Splat2Play.Runtime
 
         void Update()
         {
+            if (Keyboard.current != null && Keyboard.current.f3Key.wasPressedThisFrame)
+                Show = !Show;
+            if (!Show) return;
+
+            if (Proxy == null && TryGetComponent<SplatLevel>(out var lvl))
+                Proxy = lvl.Proxy;
+
             _fps = Mathf.Lerp(_fps, 1f / Mathf.Max(Time.unscaledDeltaTime, 1e-4f), 0.05f);
             long totalMem = Profiler.GetTotalAllocatedMemoryLong() / (1024 * 1024);
-            string splat = SplatRenderer != null && SplatRenderer.isActiveAndEnabled
-                ? $"{SplatRenderer.splatCount:N0}"
-                : "已流送卸载";
+            int activeCount = SplatRenderer != null && SplatRenderer.isActiveAndEnabled ? SplatRenderer.splatCount : 0;
+            int sourceCount = Proxy != null && Proxy.SourceSplatCount > 0 ? Proxy.SourceSplatCount : activeCount;
+            // GPU 显存估算:每 splat 静态数据约 60B + 视图/排序缓冲约 24B ≈ 84B
+            float vramMb = activeCount * 84f / (1024f * 1024f);
+
+            string splat = activeCount > 0
+                ? $"{activeCount:N0} / {sourceCount:N0}"
+                : $"0 / {sourceCount:N0} (已卸载/剔除)";
             string sh = SplatRenderer != null ? $"SH{SplatRenderer.m_SHOrder}" : "-";
             string proxy = Proxy != null ? $"{Proxy.TriangleCount:N0} 三角形" : "无代理";
+
             string streaming = "关闭";
-            var st = GetComponent<S2PSplatStreaming>();
-            if (st != null && st.enabled) streaming = st.CurrentState.ToString();
+            if (TryGetComponent<S2PSplatStreaming>(out var st) && st.enabled)
+            {
+                string cullDetail = st.IsOccluded ? " [代理遮挡]" : (!st.IsFrustumVisible ? " [视锥外]" : "");
+                streaming = $"{st.CurrentState}{cullDetail}";
+            }
+
+            bool lightOn = TryGetComponent<S2PLightModulationDriver>(out var ld)
+                           && ld.enabled && ld.Flashlight != null && ld.Flashlight.isActiveAndEnabled;
+
             _text =
-                $"[Splat2Play 性能]\n" +
-                $"fps: {_fps:F0}  帧: {Time.unscaledDeltaTime * 1000f:F1} ms\n" +
+                $"[Splat2Play 性能面板 (F3)]\n" +
+                $"fps: {_fps:F0}  帧耗时: {Time.unscaledDeltaTime * 1000f:F1} ms\n" +
                 $"splat: {splat} ({sh})\n" +
                 $"代理: {proxy}\n" +
-                $"流送: {streaming}\n" +
-                $"托管外内存: {totalMem} MB";
+                $"流送/剔除: {streaming}\n" +
+                $"动态光照: {(lightOn ? "开启 (ShadowsOnly+合成)" : "关闭")}\n" +
+                $"显存估算: {vramMb:F1} MB | 引擎总内存: {totalMem} MB";
         }
 
         void OnGUI()

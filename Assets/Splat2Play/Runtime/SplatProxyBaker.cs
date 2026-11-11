@@ -69,7 +69,6 @@ namespace Splat2Play.Runtime
                 using var seals = ToAabbs(settings.SealVolumes);
 
                 // —— 2. 包围盒与网格 ——
-                using (var positions = splats.ToPositions())
                 using (var mmResult = new NativeArray<float3>(2, Allocator.TempJob, NativeArrayOptions.UninitializedMemory))
                 {
                     // 百分位包围盒:逐轴取 [p, 100-p] 分位,剔除天空等远距离离群 splat
@@ -77,12 +76,12 @@ namespace Splat2Play.Runtime
                     float3 mn, mx;
                     if (p > 0.01f)
                     {
-                        ComputePercentileBounds(positions, exclusions, p, out mn, out mx);
+                        ComputePercentileBounds(splats, exclusions, p, out mn, out mx);
                         if (math.any(mx - mn < 1e-3f)) { mn = float3.zero; mx = float3.zero; } // 退化保护
                     }
                     else
                     {
-                        var mm = new MinMaxJob { Positions = positions, Exclusions = exclusions, Result = mmResult };
+                        var mm = new MinMaxJob { Splats = splats, Exclusions = exclusions, Result = mmResult };
                         mm.Schedule().Complete();
                         mn = mmResult[0]; mx = mmResult[1];
                     }
@@ -223,16 +222,16 @@ namespace Splat2Play.Runtime
         }
 
         /// <summary>百分位包围盒:逐轴取 [p, 100-p] 分位(采样后排序,过滤排除区,确定性)。</summary>
-        static void ComputePercentileBounds(NativeArray<float3> positions, NativeArray<AabbRange> exclusions, float percentile, out float3 mn, out float3 mx)
+        static void ComputePercentileBounds(NativeArray<SplatRaw> splats, NativeArray<AabbRange> exclusions, float percentile, out float3 mn, out float3 mx)
         {
-            int sampleCount = math.min(positions.Length, 8192);
-            int stride = math.max(1, positions.Length / sampleCount);
+            int sampleCount = math.min(splats.Length, 8192);
+            int stride = math.max(1, splats.Length / sampleCount);
             var xs = new System.Collections.Generic.List<float>(sampleCount);
             var ys = new System.Collections.Generic.List<float>(sampleCount);
             var zs = new System.Collections.Generic.List<float>(sampleCount);
-            for (int i = 0; i < positions.Length; i += stride)
+            for (int i = 0; i < splats.Length; i += stride)
             {
-                float3 p = positions[i];
+                float3 p = splats[i].Position;
                 bool excluded = false;
                 for (int e = 0; e < exclusions.Length; ++e)
                     if (exclusions[e].Contains(p)) { excluded = true; break; }
@@ -255,13 +254,6 @@ namespace Splat2Play.Runtime
             v.Sort();
             int idx = Mathf.Clamp((int)(v.Count * p / 100f), 0, v.Count - 1);
             return v[idx];
-        }
-
-        static NativeArray<float3> ToPositions(this NativeArray<SplatRaw> splats)        {
-            var positions = new NativeArray<float3>(splats.Length, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-            for (int i = 0; i < splats.Length; ++i)
-                positions[i] = splats[i].Position;
-            return positions; // 调用方以 using 持有并在用后释放
         }
 
         static NativeArray<AabbRange> ToAabbs(System.Collections.Generic.List<Bounds> bounds)
@@ -300,9 +292,14 @@ namespace Splat2Play.Runtime
                 for (int k = 0; k < 3; ++k) cleanT.Add(remap[triangles[t + k]]);
             }
 
-            var mesh = new Mesh { name = "S2P_ProxyCollision" };
+            var mesh = new Mesh
+            {
+                name = "S2P_ProxyCollision",
+                indexFormat = cleanV.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16
+            };
             mesh.vertices = cleanV.ToArray();
             mesh.SetIndices(cleanT.ToArray(), MeshTopology.Triangles, 0, false);
+            mesh.RecalculateNormals();
             mesh.RecalculateBounds();
             log.AppendLine($"Mesh: {cleanV.Count:N0} 顶点 / {cleanT.Count / 3:N0} 三角形(原始 {vertices.Length:N0}/{triangles.Count / 3:N0},丢弃脏顶点 {vertices.Length - cleanV.Count:N0}、脏三角形 {droppedTris:N0}) | bounds={mesh.bounds.size:F2} center={mesh.bounds.center:F2}");
             return mesh;

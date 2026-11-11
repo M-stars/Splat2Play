@@ -269,6 +269,17 @@ namespace Splat2Play.Tests
                     float m = math.cmax(math.abs(v));
                     Assert.That(m, Is.InRange(3.5f, 5.5f), "顶点应位于立方体表面附近");
                 }
+
+                // 每个三角形的绕序法线应一致朝外(与质心向量点积 > 0)
+                for (int t = 0; t + 2 < tris.Length; t += 3)
+                {
+                    float3 v0 = verts[tris[t]];
+                    float3 v1 = verts[tris[t + 1]];
+                    float3 v2 = verts[tris[t + 2]];
+                    float3 n = math.cross(v1 - v0, v2 - v0);
+                    float3 c = (v0 + v1 + v2) / 3f;
+                    Assert.Greater(math.dot(n, c), 0f, $"三角形 {t / 3} 法线朝内(绕序错误)");
+                }
             }
         }
 
@@ -341,10 +352,7 @@ namespace Splat2Play.Tests
                     }.Schedule().Complete();
                 }
                 finally { diagW.Dispose(); }
-                    var mmPos = new NativeArray<float3>(1, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-                    try { mmPos[0] = splats[0].Position;
-                        new MinMaxJob { Positions = mmPos, Exclusions = excl, Result = mmResult }.Schedule().Complete();
-                    } finally { mmPos.Dispose(); }
+                    new MinMaxJob { Splats = splats, Exclusions = excl, Result = mmResult }.Schedule().Complete();
                 }
             }
             finally
@@ -352,6 +360,31 @@ namespace Splat2Play.Tests
                 splats.Dispose(); density.Dispose(); excl.Dispose(); seals.Dispose(); mmResult.Dispose();
             }
             System.Threading.Thread.Sleep(1500); // 等 Burst 异步编译落地
+        }
+
+        [Test]
+        public void Bake_ExclusionVolume_FiltersOutliersFromBounds()
+        {
+            var splats = new[]
+            {
+                new TestSplat { Pos = new float3(0f, 0f, 0f), LogScale = new float3((float)Math.Log(0.2)), Quat = new float4(0, 0, 0, 1), OpacityRaw = 3f },
+                new TestSplat { Pos = new float3(0.2f, 0.1f, -0.1f), LogScale = new float3((float)Math.Log(0.2)), Quat = new float4(0, 0, 0, 1), OpacityRaw = 3f },
+                new TestSplat { Pos = new float3(500f, 500f, 500f), LogScale = new float3((float)Math.Log(0.2)), Quat = new float4(0, 0, 0, 1), OpacityRaw = 3f }
+            };
+            byte[] ply = BuildPly(splats);
+            var settings = ScriptableObject.CreateInstance<ProxyBakeSettings>();
+            settings.VoxelResolution = 64;
+            settings.ExclusionVolumes.Add(new Bounds(new Vector3(500f, 500f, 500f), Vector3.one * 20f));
+            try
+            {
+                using var res = SplatProxyBaker.Bake(new MemoryStream(ply), settings);
+                Assert.Less(res.SceneBounds.size.x, 5f, "排除区内的远距离离群点不应撑大 SceneBounds");
+                Assert.Greater(res.Mesh.normals.Length, 0, "BuildMesh 应生成顶点法线");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(settings);
+            }
         }
 
         [Test]

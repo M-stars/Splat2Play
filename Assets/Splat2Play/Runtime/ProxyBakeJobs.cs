@@ -64,7 +64,7 @@ namespace Splat2Play.Runtime
     [BurstCompile(FloatMode = FloatMode.Fast)]
     public struct MinMaxJob : IJob
     {
-        [ReadOnly] public NativeArray<float3> Positions;
+        [ReadOnly] public NativeArray<SplatRaw> Splats;
         [ReadOnly] public NativeArray<AabbRange> Exclusions;
         public NativeArray<float3> Result; // [0]=min [1]=max(仅统计不在排除区内的 splat)
 
@@ -72,9 +72,9 @@ namespace Splat2Play.Runtime
         {
             float3 mn = new(float.PositiveInfinity), mx = new(float.NegativeInfinity);
             bool any = false;
-            for (int i = 0; i < Positions.Length; ++i)
+            for (int i = 0; i < Splats.Length; ++i)
             {
-                float3 p = Positions[i];
+                float3 p = Splats[i].Position;
                 if (Exclusions.Length > 0)
                 {
                     bool excluded = false;
@@ -340,21 +340,42 @@ namespace Splat2Play.Runtime
                     }
                 }
 
-                // Pass 2: 沿三轴连接相邻 surface cell,输出四边形(两三角形)
-                int stepX = 1, stepY = n, stepZ = n2;
+                // Pass 2: 仅遍历表面 cell 的 3 条起点轴向边(+X/+Y/+Z),若该边跨阈值则连接环绕它的 4 个相邻 cell,
+                // 并按实心→空气方向决定三角形绕序,保证 O(|surfaceCells|) 复杂度、严格流形且法线一致朝外
                 for (int s = 0; s < surfaceCells.Length; ++s)
                 {
                     int idx = surfaceCells[s];
-                    for (int axis = 0; axis < 3; ++axis)
+                    int x = idx % n, y = (idx / n) % n, z = idx / n2;
+                    bool s0 = Field(idx) >= thr;
+
+                    if (y > 0 && z > 0 && s0 != (Field(idx + 1) >= thr))
                     {
-                        int stepA = axis == 0 ? stepX : axis == 1 ? stepY : stepZ;
-                        int stepB = axis == 0 ? stepY : axis == 1 ? stepZ : stepX;
-                        if (!cellToVertex.TryGetValue(idx, out int v0)) continue;
-                        if (!cellToVertex.TryGetValue(idx + stepA, out int v3)) continue;
-                        if (!cellToVertex.TryGetValue(idx + stepB, out int v1)) continue;
-                        if (!cellToVertex.TryGetValue(idx + stepA + stepB, out int v2)) continue;
-                        Triangles.Add(v0); Triangles.Add(v1); Triangles.Add(v2);
-                        Triangles.Add(v0); Triangles.Add(v2); Triangles.Add(v3);
+                        EmitQuad(cellToVertex,
+                            idx - n - n2,
+                            idx - n2,
+                            idx,
+                            idx - n,
+                            s0, Triangles);
+                    }
+
+                    if (x > 0 && z > 0 && s0 != (Field(idx + n) >= thr))
+                    {
+                        EmitQuad(cellToVertex,
+                            idx - 1 - n2,
+                            idx - 1,
+                            idx,
+                            idx - n2,
+                            s0, Triangles);
+                    }
+
+                    if (x > 0 && y > 0 && s0 != (Field(idx + n2) >= thr))
+                    {
+                        EmitQuad(cellToVertex,
+                            idx - 1 - n,
+                            idx - n,
+                            idx,
+                            idx - 1,
+                            s0, Triangles);
                     }
                 }
             }
@@ -366,6 +387,26 @@ namespace Splat2Play.Runtime
         }
 
         float Field(int idx) => (DensityQ16[idx] & 0x7FFFFFFF) * (1f / 65536f); // 忽略 outside 位并归一化到浮点密度
+
+        static void EmitQuad(NativeParallelHashMap<int, int> cellToVertex,
+                             int c00, int c10, int c11, int c01, bool positiveNormal,
+                             NativeList<int> tris)
+        {
+            if (!cellToVertex.TryGetValue(c00, out int v00)) return;
+            if (!cellToVertex.TryGetValue(c10, out int v10)) return;
+            if (!cellToVertex.TryGetValue(c11, out int v11)) return;
+            if (!cellToVertex.TryGetValue(c01, out int v01)) return;
+            if (positiveNormal)
+            {
+                tris.Add(v00); tris.Add(v10); tris.Add(v11);
+                tris.Add(v00); tris.Add(v11); tris.Add(v01);
+            }
+            else
+            {
+                tris.Add(v00); tris.Add(v11); tris.Add(v10);
+                tris.Add(v00); tris.Add(v01); tris.Add(v11);
+            }
+        }
 
         static void Edge(float a, float b, float3 pa, float3 pb, float thr, ref float3 sum, ref int crossings)
         {

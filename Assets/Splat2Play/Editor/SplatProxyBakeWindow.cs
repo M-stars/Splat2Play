@@ -5,8 +5,10 @@
 using System.IO;
 using GaussianSplatting.Runtime;
 using Splat2Play.Runtime;
+using Unity.AI.Navigation;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.AI;
 
 namespace Splat2Play.Editor
 {
@@ -19,6 +21,7 @@ namespace Splat2Play.Editor
         GaussianSplatRenderer _targetRenderer;
         ProxyBakeSettings _settings;
         bool _buildLevel = true;
+        bool _bakeNavMesh = true;
         string _lastLog;
 
         void OnGUI()
@@ -26,7 +29,7 @@ namespace Splat2Play.Editor
             EditorGUILayout.HelpBox(
                 "流程:① PLY 路径(或选中场景里的 GaussianSplatRenderer 自动取路径)\n" +
                 "② 烘焙参数 → Bake\n" +
-                "③ 自动生成 ProxyData 资产并在场景中装配 SplatLevel(碰撞 + 补丁盒体)",
+                "③ 自动生成 ProxyData 资产并在场景中一键装配 SplatLevel(碰撞 + NavMesh + 流送 + 性能面板)",
                 MessageType.Info);
 
             _targetRenderer = (GaussianSplatRenderer)EditorGUILayout.ObjectField(
@@ -50,6 +53,10 @@ namespace Splat2Play.Editor
                 _settings = CreateSettingsAsset();
 
             _buildLevel = EditorGUILayout.Toggle("烘焙后装配 SplatLevel", _buildLevel);
+            using (new EditorGUI.DisabledScope(!_buildLevel))
+            {
+                _bakeNavMesh = EditorGUILayout.Toggle("同时烘焙 NavMesh (M2)", _bakeNavMesh);
+            }
 
             using (new EditorGUI.DisabledScope(!CanBake))
             {
@@ -106,6 +113,22 @@ namespace Splat2Play.Editor
                     level.SplatRenderer = renderer;
                     level.Proxy = proxy;
                     level.BuildCollision();
+
+                    var streaming = go.GetComponent<S2PSplatStreaming>() ?? go.AddComponent<S2PSplatStreaming>();
+                    streaming.Target = renderer;
+
+                    var panel = go.GetComponent<S2PPerfPanel>() ?? go.AddComponent<S2PPerfPanel>();
+                    panel.SplatRenderer = renderer;
+                    panel.Proxy = proxy;
+
+                    if (_bakeNavMesh)
+                    {
+                        var surface = go.GetComponent<NavMeshSurface>() ?? go.AddComponent<NavMeshSurface>();
+                        surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
+                        surface.collectObjects = CollectObjects.Children;
+                        surface.BuildNavMesh();
+                    }
+
                     Undo.RegisterCreatedObjectUndo(go, "Splat2Play Bake Level");
                     Selection.activeGameObject = go;
                 }
