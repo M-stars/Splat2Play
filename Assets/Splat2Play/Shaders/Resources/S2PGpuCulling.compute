@@ -12,6 +12,8 @@
 #pragma kernel CSResetIndirectArgs
 #pragma kernel CSCullChunks
 
+#include "UnityCG.cginc"
+
 // —— Hi-Z 金字塔构建 ——
 Texture2D<float> _S2PHiZSrcDepth;   // 相机深度(全局,Reversed-Z:近=1 远=0)
 RWTexture2D<float> _HiZDst;         // 目标 mip
@@ -26,16 +28,18 @@ void CSHiZMip0(uint3 id : SV_DispatchThreadID)
     if (dst.x >= (uint)_HiZDstSize.x || dst.y >= (uint)_HiZDstSize.y)
         return;
     float2 perTexel = _HiZSrcSize.xy / _HiZDstSize.xy;
-    uint x0 = (uint)(dst.x * perTexel.x);
-    uint x1 = min((uint)ceil((dst.x + 1) * perTexel.x), (uint)_HiZSrcSize.x);
-    uint y0 = (uint)(dst.y * perTexel.y);
-    uint y1 = min((uint)ceil((dst.y + 1) * perTexel.y), (uint)_HiZSrcSize.y);
+    uint srcW = max((uint)_HiZSrcSize.x, 1u);
+    uint srcH = max((uint)_HiZSrcSize.y, 1u);
+    uint x0 = min((uint)(dst.x * perTexel.x), srcW - 1u);
+    uint x1 = clamp((uint)ceil((dst.x + 1) * perTexel.x), x0 + 1u, srcW);
+    uint y0 = min((uint)(dst.y * perTexel.y), srcH - 1u);
+    uint y1 = clamp((uint)ceil((dst.y + 1) * perTexel.y), y0 + 1u, srcH);
     float m = 1.0;
     for (uint y = y0; y < y1; ++y)
     for (uint x = x0; x < x1; ++x)
     {
         float d = _S2PHiZSrcDepth.Load(int3(x, y, 0));
-        // 背景/无穷远统一映射为 0(Reversed-Z 最远),保证天空背景永不产生错误遮挡
+        // 背景/未绑定默认白纹理统一映射为 0(Reversed-Z 最远),保证天空背景永不产生错误遮挡
         if (d >= 1.0 - 1e-6)
             d = 0.0;
         m = min(m, d);
@@ -83,10 +87,14 @@ uint _S2PArgsUseVisibleCount;                // 1 = 排序模式,由 CSCullChunk
 [numthreads(1, 1, 1)]
 void CSResetIndirectArgs()
 {
+    // Indexed DrawProceduralIndirect 5-uint 布局:(indexCountPerInstance, instanceCount, startIndex, baseVertex, startInstance)
     _S2PIndirectArgs[0] = 6u;
     // 排序模式:0 → CSCullChunks 用 InterlockedAdd 累加真实可见数(剔除 splat 排到绘制流末尾);
     // 非排序模式(Stochastic):回退为全量实例数(中间被剔除的实例由顶点 NaN 丢弃)
     _S2PIndirectArgs[1] = _S2PArgsUseVisibleCount != 0 ? 0u : _S2PTotalSplatCount;
+    _S2PIndirectArgs[2] = 0u;
+    _S2PIndirectArgs[3] = 0u;
+    _S2PIndirectArgs[4] = 0u;
 }
 
 [numthreads(64, 1, 1)]
@@ -98,48 +106,70 @@ void CSCullChunks(uint3 id : SV_DispatchThreadID)
 
     SplatGpuChunk chunk = _S2PGpuChunks[c];
 
-#if UNITY_REVERSED_Z
-    // 8 角点 → 裁剪空间(局部 AABB 直接经组合矩阵变换)
+    // 8 角点 → 裁剪空间 6 平面测试(无除零风险,天然兼容跨越相机近平面的大包围盒)
     float3 mn = chunk.boundsMin, mx = chunk.boundsMax;
     float minNdcX = 1e9, maxNdcX = -1e9;
     float minNdcY = 1e9, maxNdcY = -1e9;
     float minNdcZ = 1e9, maxNdcZ = -1e9;
-    bool anyInFront = false;
+    bool allInFront = true;
+    uint outLeft = 0u, outRight = 0u, outBottom = 0u, outTop = 0u, outNear = 0u, outFar = 0u;
+
     [unroll]
     for (int i = 0; i < 8; ++i)
     {
         float3 corner = float3(i & 1 ? mx.x : mn.x, i & 2 ? mx.y : mn.y, i & 4 ? mx.z : mn.z);
         float4 clip = mul(_S2PCullMatrixVP, float4(corner, 1.0));
-        if (clip.w > 1e-6)
+        outLeft   += (clip.x < -clip.w) ? 1u : 0u;
+        outRight  += (clip.x >  clip.w) ? 1u : 0u;
+        outBottom += (clip.y < -clip.w) ? 1u : 0u;
+        outTop    += (clip.y >  clip.w) ? 1u : 0u;
+    #if UNITY_REVERSED_Z
+        outNear   += (clip.z >  clip.w) ? 1u : 0u;
+        outFar    += (clip.z <  0.0 || clip.w <= 0.0) ? 1u : 0u;
+    #else
+        outNear   += (clip.z < -clip.w) ? 1u : 0u;
+        outFar    += (clip.z >  clip.w || clip.w <= 0.0) ? 1u : 0u;
+    #endif
+        if (clip.w > 1e-4)
         {
             float3 ndc = clip.xyz / clip.w;
             minNdcX = min(minNdcX, ndc.x); maxNdcX = max(maxNdcX, ndc.x);
             minNdcY = min(minNdcY, ndc.y); maxNdcY = max(maxNdcY, ndc.y);
             minNdcZ = min(minNdcZ, ndc.z); maxNdcZ = max(maxNdcZ, ndc.z);
-            anyInFront = true;
+        }
+        else
+        {
+            allInFront = false;
         }
     }
 
-    uint visible = 1;
-    if (!anyInFront)
-        visible = 0;    // 完全在相机后方
-    else if (maxNdcX < -1.0 || minNdcX > 1.0 || maxNdcY < -1.0 || minNdcY > 1.0 || maxNdcZ < 0.0)
-        visible = 0;    // 视锥外(投影包围盒测试,保守)
-    else
+    uint visible = 1u;
+    if (outLeft == 8u || outRight == 8u || outBottom == 8u || outTop == 8u || outNear == 8u || outFar == 8u)
     {
-        // 屏幕投影 UV 包围盒
+        visible = 0u;   // 8 个角点全部落于某同一视锥平面外侧(严格保守视锥剔除)
+    }
+#if UNITY_REVERSED_Z
+    else if (allInFront && maxNdcZ <= 1.0)
+    {
+        // 仅当 8 个角点全部在近平面前方时执行 Hi-Z 深度遮挡剔除;
+        // 跨越近平面的近身 Chunk 保守保持可见,避免透视除法跨零误判
+    #if UNITY_UV_STARTS_AT_TOP
+        float2 uvMin = saturate(float2(minNdcX * 0.5 + 0.5, -maxNdcY * 0.5 + 0.5));
+        float2 uvMax = saturate(float2(maxNdcX * 0.5 + 0.5, -minNdcY * 0.5 + 0.5));
+    #else
         float2 uvMin = saturate(float2(minNdcX, minNdcY) * 0.5 + 0.5);
         float2 uvMax = saturate(float2(maxNdcX, maxNdcY) * 0.5 + 0.5);
+    #endif
         // 对应 Mip 层级:mip = ceil(log2(max(像素宽, 像素高)))
         float pxW = max((uvMax.x - uvMin.x) * _HiZWidth, 1.0);
         float pxH = max((uvMax.y - uvMin.y) * _HiZHeight, 1.0);
         uint mip = (uint)ceil(log2(max(pxW, pxH)));
         // 本纹理 256×128 → mip 链 0..8(共 9 级,与 C# CountMips 一致)
-        uint mipCount = 1;
+        uint mipCount = 1u;
         uint tw = _HiZWidth, th = _HiZHeight;
-        while (tw > 1 || th > 1) { tw = max(tw >> 1, 1u); th = max(th >> 1, 1u); ++mipCount; }
-        mip = min(mip, mipCount - 1);
-        float2 mipSize = float2(_HiZWidth, _HiZHeight) * exp2(-mip);
+        while (tw > 1u || th > 1u) { tw = max(tw >> 1, 1u); th = max(th >> 1, 1u); ++mipCount; }
+        mip = min(mip, mipCount - 1u);
+        float2 mipSize = max(float2(_HiZWidth, _HiZHeight) * exp2(-(float)mip), float2(1.0, 1.0));
         int2 tMin = int2(floor(uvMin * mipSize)) - 1;
         int2 tMax = int2(floor(uvMax * mipSize));
         float occluder = 1.0;
@@ -154,14 +184,11 @@ void CSCullChunks(uint3 id : SV_DispatchThreadID)
         // Chunk 最近点(Reversed-Z 下 = 角点最大 z_ndc)仍比遮挡物最薄弱处更远 → 100% 被遮挡
         float zChunkNear = maxNdcZ;
         if (zChunkNear < occluder - 1e-4)
-            visible = 0;
+            visible = 0u;
     }
-    _S2PChunkVisibleFlags[c] = visible;
-    if (visible != 0)
-        InterlockedAdd(_S2PIndirectArgs[1], chunk.splatCount);
-#else
-    // 非 Reversed-Z 平台:保持全部可见(保守,无剔除)
-    _S2PChunkVisibleFlags[c] = 1;
-    InterlockedAdd(_S2PIndirectArgs[1], chunk.splatCount);
 #endif
+
+    _S2PChunkVisibleFlags[c] = visible;
+    if (visible != 0u)
+        InterlockedAdd(_S2PIndirectArgs[1], chunk.splatCount);
 }

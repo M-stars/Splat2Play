@@ -179,13 +179,15 @@ namespace Splat2Play.Editor
                     log.AppendLine($"[M8] 分离:物体 {propSplats:N0} splats, 背景 {inpainted.Length:N0} splats(含底面修补)");
 
                     using var bake = SplatProxyBaker.Bake(propPath, settings);
+                    var propMesh = bake.Mesh;
+                    bake.Mesh = null; // 转移所有权,防止 using 结束时 DestroyImmediate 销毁碰撞体网格
                     var propGo = new GameObject("S2P_Prop_SmokeProp");
                     propGo.transform.SetParent(go.transform, false);
                     propGo.transform.localPosition = (Vector3)extraction.PropCentroids[0];
                     var pr = propGo.AddComponent<GaussianSplatRenderer>();
                     pr.m_SourcePath = propPath;
                     var mc = propGo.AddComponent<MeshCollider>();
-                    mc.sharedMesh = bake.Mesh;
+                    mc.sharedMesh = propMesh;
                     mc.convex = true;
                     var prop = propGo.AddComponent<S2PDynamicProp>();
                     prop.SplatRenderer = pr;

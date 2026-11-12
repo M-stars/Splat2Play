@@ -404,12 +404,12 @@ namespace GaussianSplatting.Runtime
             }
             if (m_IndirectArgs == null)
             {
-                // DrawProceduralIndirect 参数布局:(vertexCountPerInstance, instanceCount, startVertex, startInstance)
-                m_IndirectArgs = new ComputeBuffer(1, 16, ComputeBufferType.IndirectArguments)
+                // Indexed DrawProceduralIndirect 参数布局:(indexCountPerInstance, instanceCount, startIndex, baseVertex, startInstance)
+                m_IndirectArgs = new ComputeBuffer(1, 20, ComputeBufferType.IndirectArguments)
                 {
                     name = "S2P_IndirectArgs"
                 };
-                m_IndirectArgs.SetData(new uint[] { 6, 0, 0, 0 });
+                m_IndirectArgs.SetData(new uint[] { 6, 0, 0, 0, 0 });
             }
         }
 
@@ -462,7 +462,7 @@ namespace GaussianSplatting.Runtime
             m_FrameOffset++;
 
             m_MatSplats.SetInt(GaussianSplatRenderer.Props.SrcBlend, (int)(stochastic ? BlendMode.One : BlendMode.OneMinusDstAlpha));
-            m_MatSplats.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)(stochastic ? BlendMode.One : BlendMode.Zero));
+            m_MatSplats.SetInt(GaussianSplatRenderer.Props.DstBlend, (int)(stochastic ? BlendMode.Zero : BlendMode.One));
             m_MatSplats.SetInt(GaussianSplatRenderer.Props.ZWrite, stochastic ? 1 : 0);
 
             var mpb = m_DrawProperties;
@@ -472,13 +472,13 @@ namespace GaussianSplatting.Runtime
             mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, m_GpuSortKeys);
             mpb.SetConstantBuffer(GaussianSplatRenderer.Props.SplatGlobalUniforms, m_GlobalUniforms, 0, m_GlobalUniforms.stride);
             cmb.BeginSample(s_ProfDraw);
-            // M6 T6.3:间接绘制 —— 参数由 CSCullChunks 在 GPU 上精确累加
-            // (升序排序中被剔除 splat 的 0xFFFFFFFF 键排在绘制流末尾,instanceCount=可见数即完整绘制所有可见 splat;
+            // M6 T6.3:带索引缓冲的间接绘制 —— 参数由 CSCullChunks 在 GPU 上精确累加
+            // (Near→Far 升序排序中被剔除 splat 的 0xFFFFFFFF 键排在绘制流末尾,instanceCount=可见数即完整绘制所有可见 splat;
             //  非排序模式下参数回退为全量实例数,被剔除实例由顶点着色器 NaN 丢弃)
             if (GpuChunkCullingActive && settings.m_IndirectDraw && m_IndirectArgs != null)
             {
-                cmb.DrawProceduralIndirect(Matrix4x4.identity, m_MatSplats, 0,
-                    MeshTopology.Triangles, m_IndirectArgs, 1, mpb);
+                cmb.DrawProceduralIndirect(m_QuadIndexBuffer, Matrix4x4.identity, m_MatSplats, 0,
+                    MeshTopology.Triangles, m_IndirectArgs, 0, mpb);
             }
             else
             {

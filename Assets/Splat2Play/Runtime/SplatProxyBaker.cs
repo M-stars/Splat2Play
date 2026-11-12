@@ -115,7 +115,6 @@ namespace Splat2Play.Runtime
                                    && SystemInfo.supportsComputeShaders
                                    && res >= 256 && splats.Length >= 1_000_000;
                     bool useGpu = settings.Backend == ProxyBakeBackend.GPUCompute || autoGpu;
-                    bool gpuSdfDone = false;
                     if (useGpu && !SystemInfo.supportsComputeShaders)
                     {
                         log.AppendLine("[警告] GPUCompute 后端不可用(不支持 Compute Shader),回退 CPU 确定性管线");
@@ -124,10 +123,8 @@ namespace Splat2Play.Runtime
                     if (useGpu)
                     {
                         var gpuSw = Stopwatch.StartNew();
-                        bool sdfOnGpu = settings.UseSDF && res < 512; // 512³ 自动关 SDF 的规则与 CPU 一致
-                        S2PGpuVoxelBaker.Voxelize(splats, exclusions, grid, settings.OpacityWeight, density, sdfOnGpu);
-                        gpuSdfDone = sdfOnGpu;
-                        log.AppendLine($"[M5] GPU Compute 体素化{(sdfOnGpu ? " + SDF 平滑" : "")} 耗时 {gpuSw.ElapsedMilliseconds} ms(含读回)");
+                        S2PGpuVoxelBaker.Voxelize(splats, exclusions, grid, settings.OpacityWeight, density, sdfSmooth: false);
+                        log.AppendLine($"[M5] GPU Compute 体素化耗时 {gpuSw.ElapsedMilliseconds} ms(含读回)");
                         Progress("GPU 体素化完成", 0.55f);
                     }
                     else
@@ -163,12 +160,10 @@ namespace Splat2Play.Runtime
                     }
 
                     // —— 4.5 可选 SDF 平滑(§5.1 useSDF,512 档自动跳过以保证内存峰值 <2GB) ——
-                    // M5:GPU 后端已在读回前于 GPU 上完成平滑(规格 §2.2 流程图:体素化→SDF→读回→填充)
-                    bool applySdf = settings.UseSDF && res < 512 && !gpuSdfDone;
+                    // 统一在 FillJob(孔洞闭合/内部填充)之后执行,确保 GPU 与 CPU 后端管线阶段顺序严格一致
+                    bool applySdf = settings.UseSDF && res < 512;
                     if (settings.UseSDF && res >= 512)
                         log.AppendLine("[警告] 512³ 分辨率下已自动跳过 SDF 平滑以控制内存峰值(<2GB)");
-                    if (settings.UseSDF && gpuSdfDone)
-                        log.AppendLine("[M5] SDF 平滑已在 GPU 完成(填充前执行,规格 §2.2 GPU 路径)");
                     if (applySdf)
                     {
                         var sdfFiltered = new NativeArray<int>(grid.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);

@@ -147,7 +147,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
             _SplatViewData[_SplatOffset + idx] = culledView;
             if (_WriteSortKeys != 0)
             {
-                // 升序排序(Far→Near)中 0xFFFFFFFF 为最大键 → 排到绘制流末尾,
+                // 升序排序(Near→Far,Front-to-Back Under 混合)中 0xFFFFFFFF 为最大键 → 排到绘制流末尾,
                 // 使 DrawProceduralIndirect 以 instanceCount=可见数 即可精确跳过
                 _SplatSortDistances[_SplatOffset + idx] = 0xFFFFFFFFu;
                 _SplatSortKeys[_SplatOffset + idx] = _SplatOffset + idx;

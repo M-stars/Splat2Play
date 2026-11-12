@@ -139,7 +139,7 @@ namespace Splat2Play.Runtime
                 // 自动收集:0.5s 节流,避免每帧 FindObjectsByType 开销
                 if (Time.unscaledTime >= _nextLightCollectTime)
                 {
-                    _autoLightsCache = UnityEngine.Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
+                    _autoLightsCache = UnityEngine.Object.FindObjectsByType<Light>();
                     _nextLightCollectTime = Time.unscaledTime + 0.5f;
                 }
                 source = _autoLightsCache;

@@ -57,7 +57,7 @@ namespace Splat2Play.Editor
                         try
                         {
                             var sw = Stopwatch.StartNew();
-                            long voxMs = -1, sdfMs = -1;
+                            long voxMs = -1;
                             using var result = SplatProxyBaker.Bake(SourcePath, settings, (stage, t) =>
                             {
                                 // 从烘焙日志阶段提取体素化/SDF 阶段耗时

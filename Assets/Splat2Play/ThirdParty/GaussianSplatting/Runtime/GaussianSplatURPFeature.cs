@@ -106,6 +106,13 @@ namespace GaussianSplatting.Runtime
                 {
                     var commandBuffer = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
                     using var _ = new ProfilingScope(commandBuffer, s_profilingSampler);
+                    var system = GaussianSplatRenderSystem.instance;
+                    var camera = data.CameraData.camera;
+                    // S2P M6:GPU 分块剔除(Hi-Z + 视锥)在绑定 cameraDepth 为 DSV 渲染目标前派发,
+                    // 避免 D3D12 同一深度纹理同时作为 DSV 与 Compute SRV 读取产生状态冲突
+                    commandBuffer.SetGlobalTexture("_S2PHiZSrcDepth", data.SourceDepth);
+                    system.DispatchGpuChunkCulling(commandBuffer, data.Projection, data.View, data.Width, data.Height);
+
                     commandBuffer.SetGlobalTexture(s_gaussianSplatRT, data.GaussianSplatRT);
                     commandBuffer.SetGlobalVector(GaussianSplatRenderer.Props.CameraTargetTextureTexelSize, Vector4.zero);
                     RenderTargetIdentifier cameraDepth = data.SourceDepth;
@@ -121,12 +128,6 @@ namespace GaussianSplatting.Runtime
                         CoreUtils.SetRenderTarget(commandBuffer, data.GaussianSplatRT, cameraDepth, ClearFlag.Color, Color.clear);
 
                     commandBuffer.SetViewport(new Rect(0, 0, data.Width, data.Height));
-                    var system = GaussianSplatRenderSystem.instance;
-                    var camera = data.CameraData.camera;
-                    // S2P M6:GPU 分块剔除(Hi-Z + 视锥)必须在 CalcViewData/排序之前派发;
-                    // 深度纹理由调用方绑定为全局 "_S2PHiZSrcDepth"
-                    commandBuffer.SetGlobalTexture("_S2PHiZSrcDepth", data.SourceDepth);
-                    system.DispatchGpuChunkCulling(commandBuffer, data.Projection, data.View, data.Width, data.Height);
                     Material matComposite = system.SortAndRenderSplats(camera, commandBuffer, data.Projection, data.Width, data.Height, data.View);
                     commandBuffer.BeginSample(GaussianSplatRenderSystem.s_ProfCompose);
                     if (data.Filter != StochasticTemporalFilter.None)

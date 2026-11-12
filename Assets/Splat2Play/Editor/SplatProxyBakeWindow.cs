@@ -269,7 +269,13 @@ namespace Splat2Play.Editor
                             // 64³ 快速烘焙凸包碰撞网格(<50ms 量级)
                             using var bake = SplatProxyBaker.Bake(propPath, propSettings);
                             var mesh = bake.Mesh;
+                            bake.Mesh = null; // 转移 Mesh 所有权,防止 using 作用域结束时 Dispose 销毁碰撞网格
                             mesh.name = $"S2P_Prop_{extraction.PropNames[v]}_Collision";
+
+                            string bakedDir = "Assets/Splat2Play/Baked";
+                            if (!AssetDatabase.IsValidFolder(bakedDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                            string meshAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedDir}/{baseName}_{extraction.PropNames[v]}_Collider.asset");
+                            AssetDatabase.CreateAsset(mesh, meshAssetPath);
 
                             // 装配子物体:渲染器 + 凸包碰撞 + 刚体 + NavMeshObstacle
                             Transform parent = _targetRenderer != null ? _targetRenderer.transform.parent : null;
