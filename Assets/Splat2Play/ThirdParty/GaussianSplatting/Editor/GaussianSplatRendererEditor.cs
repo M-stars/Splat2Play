@@ -15,6 +15,7 @@ namespace GaussianSplatting.Editor
     public class GaussianSplatRendererEditor : UnityEditor.Editor
     {
         SerializedProperty m_PropSourcePath;
+        SerializedProperty m_PropPrecompiledAsset;
         SerializedProperty m_PropSplatScale;
         SerializedProperty m_PropOpacityScale;
         SerializedProperty m_PropSHOrder;
@@ -26,6 +27,7 @@ namespace GaussianSplatting.Editor
         public void OnEnable()
         {
             m_PropSourcePath = serializedObject.FindProperty("m_SourcePath");
+            m_PropPrecompiledAsset = serializedObject.FindProperty("m_PrecompiledAsset");
             m_PropSplatScale = serializedObject.FindProperty("m_SplatScale");
             m_PropOpacityScale = serializedObject.FindProperty("m_OpacityScale");
             m_PropSHOrder = serializedObject.FindProperty("m_SHOrder");
@@ -65,6 +67,12 @@ namespace GaussianSplatting.Editor
             }
 
             EditorGUILayout.Space();
+            GUILayout.Label("Precompiled Asset (M9)", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(m_PropPrecompiledAsset);
+            if (gs.m_PrecompiledAsset != null && gs.LastLoadMilliseconds >= 0)
+                EditorGUILayout.LabelField("Fast Load Time", $"{gs.LastLoadMilliseconds:F1} ms");
+
+            EditorGUILayout.Space();
             GUILayout.Label("Render Options", EditorStyles.boldLabel);
             EditorGUILayout.PropertyField(m_PropSplatScale);
             EditorGUILayout.PropertyField(m_PropOpacityScale);
@@ -81,8 +89,9 @@ namespace GaussianSplatting.Editor
             bool sourceChanged = false;
             foreach (var obj in targets)
                 sourceChanged |= !source.hasMultipleDifferentValues && ((GaussianSplatRenderer)obj).m_SourcePath != sourcePath;
+            bool precompiledChanged = m_PropPrecompiledAsset.objectReferenceValue != gs.m_PrecompiledAsset;
             serializedObject.ApplyModifiedProperties();
-            if (GUILayout.Button("Reload") || sourceChanged)
+            if (GUILayout.Button("Reload") || sourceChanged || precompiledChanged)
                 foreach (var obj in targets) ((GaussianSplatRenderer)obj).Reload();
             if (validAndEnabled && targets.Length == 1)
             {

@@ -954,5 +954,105 @@ namespace Splat2Play.Tests
                 Fdc = fdc
             };
         }
+
+        // ==================== M9(方向 6):预编译二进制资产管线 ====================
+
+        [Test]
+        public void M9_PrecompiledAsset_RoundTrip_BitExact()
+        {
+            // 合成 GaussianSplatData:1000 splats,SH1(3 系数 → 每 splat 2 uint SH 数据)
+            int count = 1000;
+            var data = new GaussianSplatting.Runtime.GaussianSplatData(count, 1);
+            var rng = new System.Random(90210);
+            float3 mn = new float3(float.PositiveInfinity), mx = new float3(float.NegativeInfinity);
+            for (int i = 0; i < count; ++i)
+            {
+                float3 p = new float3((float)rng.NextDouble() * 40f - 20f, (float)rng.NextDouble() * 8f - 4f, (float)rng.NextDouble() * 30f - 15f);
+                mn = math.min(mn, p); mx = math.max(mx, p);
+                data.positions[i * 3 + 0] = math.asuint(p.x);
+                data.positions[i * 3 + 1] = math.asuint(p.y);
+                data.positions[i * 3 + 2] = math.asuint(p.z);
+                data.geometry[i * 3 + 0] = (uint)(i * 5 + 1);
+                data.geometry[i * 3 + 1] = (uint)(i * 5 + 2);
+                data.geometry[i * 3 + 2] = (uint)(i * 5 + 3);
+                data.colors[i] = (uint)(i * 3 + 7);       // 身份锚点
+                data.sh[i * 2 + 0] = (uint)(i * 11 + 1);
+                data.sh[i * 2 + 1] = (uint)(i * 11 + 2);
+            }
+            data.bounds.SetMinMax(mn, mx);
+
+            string binPath = Path.Combine(Path.GetTempPath(), $"s2p_test_m9_{System.Guid.NewGuid():N}.s2pbin");
+            try
+            {
+                var asset = GaussianSplatting.Runtime.SplatAssetPrecompiler.BuildFromData(data, null, binPath, mortonReorder: true);
+                // BuildFromData 就地重排 → 快照重排后的期望四路数组
+                var expPos = data.positions.ToArray();
+                var expGeo = data.geometry.ToArray();
+                var expCol = data.colors.ToArray();
+                var expSh = data.sh.ToArray();
+
+                // —— 元数据断言 ——
+                Assert.AreEqual(count, asset.SplatCount);
+                Assert.AreEqual(1, asset.ShDegree);
+                Assert.AreEqual(3, asset.ShCoefficients);
+                Assert.IsTrue(asset.IsMortonReordered);
+                Assert.AreEqual(1, asset.ChunkBounds.Length, "ceil(1000/4096) = 1 个分块");
+                Assert.AreEqual(1, asset.ChunkSplatCounts.Length);
+                Assert.AreEqual(1000, asset.ChunkSplatCounts[0]);
+                Assert.AreNotEqual(0u, asset.PayloadCrc32);
+                Assert.That(asset.LocalBounds.size.x, Is.EqualTo(data.bounds.size.x).Within(1e-4));
+                Assert.That(asset.LocalBounds.min.y, Is.EqualTo(data.bounds.min.y).Within(1e-4));
+
+                // —— Header 断言(魔数/版本/长度/CRC)——
+                var hdr = GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadHeader(binPath);
+                Assert.AreEqual(GaussianSplatting.Runtime.S2PBinHeader.kMagic, hdr.Magic);
+                Assert.AreEqual(GaussianSplatting.Runtime.S2PBinHeader.kVersion, hdr.Version);
+                Assert.AreEqual(count, hdr.SplatCount);
+                Assert.AreEqual(1, hdr.ShDegree);
+                Assert.AreEqual(1, hdr.MortonReordered);
+                Assert.AreEqual((uint)(count * 12), hdr.PosBytes);
+                Assert.AreEqual((uint)(count * 12), hdr.OtherBytes, "geometry = quat + half2×2 → 3 uint/splat");
+                Assert.AreEqual((uint)(count * 4), hdr.ColorBytes);
+                Assert.AreEqual((uint)(count * 8), hdr.ShBytes, "SH1 = 2 uint/splat");
+                Assert.AreEqual(asset.PayloadCrc32, hdr.PayloadCrc32);
+                long fileSize = new FileInfo(binPath).Length;
+                Assert.AreEqual(64 + hdr.PayloadBytes, (uint)fileSize, "64B 头 + 四路载荷");
+
+                // —— 读回:四路数组与原数组逐位 100% 相等 ——
+                using var loaded = GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadPayload(binPath, asset);
+                Assert.AreEqual(count, loaded.count);
+                var gotPos = loaded.positions.ToArray();
+                var gotGeo = loaded.geometry.ToArray();
+                var gotCol = loaded.colors.ToArray();
+                var gotSh = loaded.sh.ToArray();
+                for (int i = 0; i < expPos.Length; ++i)
+                {
+                    Assert.AreEqual(expPos[i], gotPos[i], $"positions[{i}] 不一致");
+                    Assert.AreEqual(expGeo[i], gotGeo[i], $"geometry[{i}] 不一致");
+                }
+                for (int i = 0; i < expCol.Length; ++i)
+                    Assert.AreEqual(expCol[i], gotCol[i], $"colors[{i}] 不一致");
+                for (int i = 0; i < expSh.Length; ++i)
+                    Assert.AreEqual(expSh[i], gotSh[i], $"sh[{i}] 不一致");
+
+                // —— 损坏检测:翻转载荷一个字节 → CRC 校验必须失败 ——
+                byte[] corrupted = File.ReadAllBytes(binPath);
+                corrupted[64 + 777] ^= 0xFF;
+                File.WriteAllBytes(binPath, corrupted);
+                Assert.Throws<InvalidDataException>(() =>
+                    GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadPayload(binPath, asset), "CRC 必须拦截载荷损坏");
+
+                // —— 魔数检测 ——
+                corrupted[0] = 0x00;
+                File.WriteAllBytes(binPath, corrupted);
+                Assert.Throws<InvalidDataException>(() =>
+                    GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadHeader(binPath), "魔数必须被拦截");
+            }
+            finally
+            {
+                data.Dispose();
+                if (File.Exists(binPath)) File.Delete(binPath);
+            }
+        }
     }
 }

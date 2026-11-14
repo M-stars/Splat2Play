@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Profiling;
@@ -620,6 +621,9 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Path relative to StreamingAssets or current directory, an absolute path, or a URL") ]
         public string m_SourcePath;
 
+        [Tooltip("M9:预编译商业资产(.asset + .s2pbin)。非空时走零解码/零排序直通加载,载荷缺失自动回退 m_SourcePath")]
+        public GaussianSplatPrecompiledAsset m_PrecompiledAsset;
+
         // Call after any runtime changes that affect splat visibility / history
         public void InvalidateTemporalHistory() => GaussianSplatRenderSystem.instance.InvalidateTemporalHistory();
 
@@ -664,12 +668,15 @@ namespace GaussianSplatting.Runtime
         GaussianSplatLoadOperation m_LoadOperation;
         int m_SHCoefficients;
         bool m_Registered;
+        long m_ReloadStartTicks;
 
         public bool isLoading { get; private set; }
         public string loadError { get; private set; }
         public Bounds localBounds { get; private set; }
         public int sourceSHDegree { get; private set; }
         public GaussianSplatCameras.CameraInfo[] cameras { get; private set; } = Array.Empty<GaussianSplatCameras.CameraInfo>();
+        /// <summary>M9:最近一次加载耗时(ms)。预编译直通路径为端到端(读盘+CRC+GPU 上传);异步路径到 TakeData 为止。</summary>
+        public double LastLoadMilliseconds { get; private set; } = -1;
 
         internal static readonly ProfilerMarker s_ProfSort = new(ProfilerCategory.Render, "GaussianSplat.Sort", MarkerFlags.SampleGPU);
 
@@ -728,14 +735,15 @@ namespace GaussianSplatting.Runtime
             catch { buffer.Dispose(); throw; }
         }
 
-        void CreateResources(GaussianSplatData data)
+        void CreateResources(GaussianSplatData data, Bounds[] chunkBoundsOverride = null)
         {
             m_SplatCount = data.count;
             sourceSHDegree = data.shDegree;
             m_SHCoefficients = data.shCoefficients;
             localBounds = data.bounds;
-            // M6 T6.1:Morton 空间重排 + 分块 AABB 构建(纯双射置换,不改变渲染语义)
-            Bounds[] chunkBounds = m_MortonReorder ? SplatMortonReorder.ReorderAndBuildChunks(data) : null;
+            // M6 T6.1:Morton 空间重排 + 分块 AABB 构建(纯双射置换,不改变渲染语义);
+            // M9:预编译路径传入 chunkBoundsOverride(磁盘上已是 Morton 序,完全跳过重排与解压)
+            Bounds[] chunkBounds = chunkBoundsOverride ?? (m_MortonReorder ? SplatMortonReorder.ReorderAndBuildChunks(data) : null);
             m_GpuPosData = Upload(data.positions, "GaussianPosData");
             m_GpuOtherData = Upload(data.geometry, "GaussianOtherData");
             m_GpuColorData = Upload(data.colors, "GaussianColorData");
@@ -848,11 +856,16 @@ namespace GaussianSplatting.Runtime
             DisposeResources();
             loadError = null;
             cameras = Array.Empty<GaussianSplatCameras.CameraInfo>();
-            if (!isActiveAndEnabled || string.IsNullOrWhiteSpace(m_SourcePath)) return;
+            if (!isActiveAndEnabled) return;
+            // M9 T9.3:预编译资产直通加载(零 CPU 解码、零运行时 Morton 排序);
+            // 载荷缺失/损坏时回退 m_SourcePath 原始路径(100% 保留)。
+            if (m_PrecompiledAsset != null && TryLoadPrecompiled(m_PrecompiledAsset)) return;
+            if (string.IsNullOrWhiteSpace(m_SourcePath)) return;
             try
             {
                 if (!resourcesAreSetUp) throw new InvalidOperationException("Shader resources are missing or compute shaders are unsupported");
                 EnsureRegistered();
+                m_ReloadStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 m_LoadOperation = new GaussianSplatLoadOperation(Application.streamingAssetsPath, m_SourcePath);
                 isLoading = true;
 #if UNITY_EDITOR
@@ -860,6 +873,34 @@ namespace GaussianSplatting.Runtime
 #endif
             }
             catch (Exception e) { LoadFailed(e); }
+        }
+
+        /// <summary>M9:同步直通加载预编译资产(读盘 + CRC 校验 + GPU 上传,典型 <35ms)。返回 false 表示载荷不可用(回退)。</summary>
+        bool TryLoadPrecompiled(GaussianSplatPrecompiledAsset asset)
+        {
+            string payload = asset.ResolvePayloadFullPath();
+            if (string.IsNullOrEmpty(payload) || !File.Exists(payload))
+            {
+                Debug.LogWarning($"[S2P M9] 预编译载荷缺失({payload ?? "null"}),回退 m_SourcePath 加载路径", this);
+                return false;
+            }
+            try
+            {
+                if (!resourcesAreSetUp) throw new InvalidOperationException("Shader resources are missing or compute shaders are unsupported");
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                using var data = SplatAssetPrecompiler.ReadPayload(payload, asset);
+                CreateResources(data, asset.ChunkBounds);
+                cameras = asset.Cameras ?? Array.Empty<GaussianSplatCameras.CameraInfo>();
+                sw.Stop();
+                LastLoadMilliseconds = sw.Elapsed.TotalMilliseconds;
+                Debug.Log($"[S2P M9] 预编译直通加载 '{asset.name}': {m_SplatCount:N0} splats / {LastLoadMilliseconds:F1} ms(CRC 0x{asset.PayloadCrc32:X8})", this);
+                return true;
+            }
+            catch (Exception e)
+            {
+                LoadFailed(e);
+                return true; // 失败已报告,不再回退到慢路径重试同一文件
+            }
         }
 
         void LoadFailed(Exception e)
@@ -1013,6 +1054,7 @@ namespace GaussianSplatting.Runtime
                 if (data != null)
                 {
                     CreateResources(data);
+                    LastLoadMilliseconds = (System.Diagnostics.Stopwatch.GetTimestamp() - m_ReloadStartTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 #if UNITY_EDITOR
                     UnityEditor.SceneView.RepaintAll();
 #endif

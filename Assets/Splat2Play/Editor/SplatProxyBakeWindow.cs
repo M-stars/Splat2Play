@@ -24,6 +24,7 @@ namespace Splat2Play.Editor
         bool _bakeNavMesh = true;
         bool _showSceneHandles = true;
         bool _replaceBackground = true;
+        bool _bindAfterPrecompile = true;
         string _lastLog;
 
         void OnEnable() => SceneView.duringSceneGui += OnSceneGUI;
@@ -93,6 +94,16 @@ namespace Splat2Play.Editor
             {
                 if (GUILayout.Button("Bake", GUILayout.Height(32)))
                     Bake();
+            }
+
+            // —— M9 T9.4:预编译为商业资产包(.asset + .s2pbin,零解码 <35ms 瞬时上屏)——
+            EditorGUILayout.Space(6);
+            EditorGUILayout.LabelField("M9 商业资产预编译", EditorStyles.boldLabel);
+            _bindAfterPrecompile = EditorGUILayout.Toggle("预编译后一键绑定渲染器", _bindAfterPrecompile);
+            using (new EditorGUI.DisabledScope(!CanBake))
+            {
+                if (GUILayout.Button("预编译为商业资产包 (Precompile Splat Asset)", GUILayout.Height(24)))
+                    PrecompileSplatAsset();
             }
 
             if (!string.IsNullOrEmpty(_lastLog))
@@ -216,6 +227,60 @@ namespace Splat2Play.Editor
         bool CanBake =>
             !string.IsNullOrWhiteSpace(_plyPath) && File.Exists(_plyPath)
             && _settings != null;
+
+        /// <summary>
+        /// M9 T9.2/T9.4:把 PLY/SPZ 离线预编译为 .s2pbin 二进制载荷 + GaussianSplatPrecompiledAsset 元数据,
+        /// 可选一键绑定到场景渲染器(零解码/零排序瞬时加载;m_SourcePath 保留为回退路径)。
+        /// </summary>
+        void PrecompileSplatAsset()
+        {
+            try
+            {
+                string baseName = Path.GetFileNameWithoutExtension(_plyPath);
+                string root = Path.GetDirectoryName(Application.dataPath);
+                string binDir = Path.Combine(root, "Assets", "StreamingAssets", "scans", "compiled");
+                string binPath = Path.Combine(binDir, $"{baseName}.s2pbin");
+                Directory.CreateDirectory(binDir);
+
+                var reporter = new ProgressReporter(this);
+                GaussianSplatting.Runtime.GaussianSplatPrecompiledAsset asset =
+                    GaussianSplatting.Runtime.SplatAssetPrecompiler.PrecompileFromFile(
+                        _plyPath, binPath, mortonReorder: true,
+                        (stage, t) => reporter.Report(stage, t));
+
+                string bakedDir = "Assets/Splat2Play/Baked";
+                if (!AssetDatabase.IsValidFolder(bakedDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                string assetPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedDir}/{baseName}_SplatAsset.asset");
+                AssetDatabase.CreateAsset(asset, assetPath);
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+
+                var log = new System.Text.StringBuilder();
+                log.AppendLine($"[M9] 预编译完成:{asset.SplatCount:N0} splats, SH{asset.ShDegree}, " +
+                               $"Chunk {asset.ChunkBounds.Length}, CRC 0x{asset.PayloadCrc32:X8}");
+                log.AppendLine($"[M9] 载荷: {binPath} ({new FileInfo(binPath).Length / (1024f * 1024f):F1} MB)");
+                log.AppendLine($"[M9] 资产: {assetPath}");
+
+                if (_bindAfterPrecompile && _targetRenderer != null)
+                {
+                    Undo.RecordObject(_targetRenderer, "Splat2Play Bind Precompiled Asset");
+                    _targetRenderer.m_PrecompiledAsset = asset;
+                    _targetRenderer.Reload();
+                    log.AppendLine($"[M9] 渲染器已绑定并直通加载({_targetRenderer.LastLoadMilliseconds:F1} ms)");
+                }
+
+                _lastLog = log.ToString();
+            }
+            catch (System.Exception e)
+            {
+                _lastLog = $"预编译失败:{e.Message}";
+                Debug.LogException(e);
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+        }
 
         /// <summary>
         /// M8 T8.2:分离动态物体 —— 剥离盒内 splat 为独立 PLY(局部居中)+ 自动 64³ 凸包碰撞体
