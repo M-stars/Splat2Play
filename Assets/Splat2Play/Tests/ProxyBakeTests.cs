@@ -1111,5 +1111,220 @@ namespace Splat2Play.Tests
             Assert.AreEqual(N / 4, (N + 3) >> 2, "4096 点 LOD1 应精确激活 1024 个");
             Assert.AreEqual(N / 16, (N + 15) >> 4, "4096 点 LOD2 应精确激活 256 个");
         }
+
+        // ==================== M11(方向 7):OBB / 连通域自动分割 / 组合碰撞 ====================
+
+        [Test]
+        public void M11_ObbRange_RotatedContainsAndFloorInpaint()
+        {
+            // 合成场景:轴对齐水平地面(y=0)+ 绕 Y 旋转 45° 且底面悬浮 0.05m 的箱体点云
+            var splats = new System.Collections.Generic.List<SplatRawX>();
+            for (int z = 0; z < 31; ++z)
+            for (int x = 0; x < 31; ++x)
+                splats.Add(MakeX(new float3(-1.5f + x * 0.1f, 0f, -1.5f + z * 0.1f), 0.05f, new float3(0.35f, 0.36f, 0.34f)));
+            int groundCount = splats.Count;
+
+            float3 boxCenter = new float3(0.6f, 0.20f, 0.4f);
+            float3 halfExt = new float3(0.25f, 0.15f, 0.18f);
+            var q45 = quaternion.EulerXYZ(math.radians(new float3(0f, 45f, 0f)));
+            int boxCount = 0;
+            for (int lz = 0; lz < 6; ++lz)
+            for (int ly = 0; ly < 4; ++ly)
+            for (int lx = 0; lx < 6; ++lx)
+            {
+                float3 local = new float3(
+                    -halfExt.x * 0.8f + lx * halfExt.x * 1.6f / 5f,
+                    -halfExt.y * 0.8f + ly * halfExt.y * 1.6f / 3f,
+                    -halfExt.z * 0.8f + lz * halfExt.z * 1.6f / 5f);
+                splats.Add(MakeX(boxCenter + math.mul(q45, local), 0.02f, new float3(0.6f, 0.3f, 0.2f)));
+                boxCount++;
+            }
+
+            var settings = ScriptableObject.CreateInstance<ProxyBakeSettings>();
+            settings.DynamicProps.Add(new ProxyBakeSettings.DynamicPropVolume
+            {
+                PropName = "RotatedTable",
+                Volume = new Bounds((Vector3)boxCenter, (Vector3)(halfExt * 2f)),
+                RotationEuler = new Vector3(0f, 45f, 0f),
+                Mass = 8f
+            });
+            var splatArray = new NativeArray<SplatRawX>(splats.ToArray(), Allocator.TempJob);
+            try
+            {
+                // —— ObbRange 基础语义:45° 旋转下包含判定正确 ——
+                var obb = ObbRange.FromBoundsAndEuler(settings.DynamicProps[0].Volume, settings.DynamicProps[0].RotationEuler);
+                float3 inside = boxCenter + math.mul(q45, new float3(0.1f, 0.05f, -0.08f));
+                float3 outside = boxCenter + math.mul(q45, new float3(0.30f, 0f, 0f)); // 局部 X 超出 E
+                Assert.IsTrue(obb.Contains(inside), "OBB 内点应被包含");
+                Assert.IsFalse(obb.Contains(outside), "OBB 外点不应被包含");
+                Assert.IsTrue(obb.Contains(boxCenter), "OBB 中心应被包含");
+                // 恒等旋转退化:与轴对齐判定一致
+                var obbId = ObbRange.FromBoundsAndEuler(new Bounds(new Vector3(1f, 2f, 3f), new Vector3(2f, 4f, 6f)), Vector3.zero);
+                Assert.IsTrue(obbId.Contains(new float3(1.5f, 2.9f, 3.2f)));
+                Assert.IsFalse(obbId.Contains(new float3(2.1f, 2f, 3f)));
+
+                // —— OBB 切割:斜放物件 100% 剥离,轴对齐背景零误伤 ——
+                using var extraction = SplatPropExtractor.Extract(splatArray, settings);
+                Assert.AreEqual(1, extraction.Props.Length, "应分离出 1 个动态物体");
+                Assert.AreEqual(boxCount, extraction.Props[0].Length, "斜放物件应被 100% 剥离");
+                var bg = extraction.Background;
+                Assert.AreEqual(groundCount, bg.Length, "轴对齐背景点应零误伤");
+                for (int i = 0; i < bg.Length; ++i)
+                    Assert.That(math.abs(bg[i].Position.x), Is.LessThanOrEqualTo(1.5f + 1e-4), "背景应仅剩地面 splat");
+
+                // —— OBB 局部空间底面修补:修补点严格落在旋转后的底面足迹内 ——
+                var inpainted = SplatPropExtractor.InpaintFloors(bg, settings);
+                using (inpainted)
+                {
+                    Assert.Greater(inpainted.Length, bg.Length, "应生成修补高斯");
+                    var obbCheck = ObbRange.FromBoundsAndEuler(settings.DynamicProps[0].Volume, settings.DynamicProps[0].RotationEuler);
+                    int added = 0;
+                    for (int i = bg.Length; i < inpainted.Length; ++i)
+                    {
+                        SplatRawX s = inpainted[i];
+                        added++;
+                        float3 local = obbCheck.ToLocal(s.Position);
+                        Assert.That(math.abs(local.x), Is.LessThanOrEqualTo(obbCheck.HalfExtents.x + 1e-3),
+                            $"修补点超出旋转 OBB 足迹(X 局部 {local.x:F3})");
+                        Assert.That(math.abs(local.z), Is.LessThanOrEqualTo(obbCheck.HalfExtents.z + 1e-3),
+                            $"修补点超出旋转 OBB 足迹(Z 局部 {local.z:F3})");
+                        Assert.That(s.Position.y, Is.InRange(-0.06f, 0.06f), "修补层应贴合地面高度(y≈0)");
+                        // 修补高斯朝向应与 OBB 旋转一致(四元数 ≈ q45)
+                        float dot = math.abs(math.dot(s.Rotation, new float4(q45.value.x, q45.value.y, q45.value.z, q45.value.w)));
+                        Assert.That(dot, Is.GreaterThan(0.99f), "修补高斯旋转应随 OBB 旋转");
+                    }
+                    Assert.Greater(added, 10, "修补点数量应覆盖足迹网格");
+                }
+            }
+            finally
+            {
+                splatArray.Dispose();
+                UnityEngine.Object.DestroyImmediate(settings);
+            }
+        }
+
+        [Test]
+        public void M11_AutoPropDetector_FindsClustersAndOrientation()
+        {
+            // 合成房间:6×6m 水平地面(0.02m 间距,每格 ≥3 splat → 地面体素实心)+
+            // 地面上两个独立物件(A: 0.6×0.35×0.3 轴对齐;B: 0.8×0.4×0.3 绕 Y 旋转 30°)。
+            // 底面清除带(0.08m)会切掉物件底部 → 质心 Y 检测值略高于真实中心(容差 0.12m)。
+            var list = new System.Collections.Generic.List<SplatRawX>();
+            for (int z = 0; z < 301; ++z)
+            for (int x = 0; x < 301; ++x)
+                list.Add(MakeX(new float3(-3f + x * 0.02f, 0f, -3f + z * 0.02f), 0.02f, new float3(0.4f, 0.4f, 0.4f)));
+            var q30 = quaternion.EulerXYZ(math.radians(new float3(0f, 30f, 0f)));
+            float3 centerA = new float3(1.0f, 0.15f, 1.0f);
+            float3 halfA = new float3(0.3f, 0.15f, 0.175f);
+            float3 centerB = new float3(-1.5f, 0.15f, 0.5f);
+            float3 halfB = new float3(0.4f, 0.15f, 0.2f);
+            for (int ly = 0; ly < 16; ++ly)
+            for (int lz = 0; lz < 18; ++lz)
+            for (int lx = 0; lx < 31; ++lx)
+            {
+                float3 local = new float3(-halfA.x + lx * 0.02f, ly * 0.02f, -halfA.z + lz * 0.02f);
+                list.Add(MakeX(centerA + local, 0.02f, new float3(0.5f, 0.4f, 0.3f)));
+            }
+            for (int ly = 0; ly < 16; ++ly)
+            for (int lz = 0; lz < 21; ++lz)
+            for (int lx = 0; lx < 41; ++lx)
+            {
+                float3 local = new float3(-halfB.x + lx * 0.02f, ly * 0.02f, -halfB.z + lz * 0.02f);
+                list.Add(MakeX(centerB + math.mul(q30, local), 0.02f, new float3(0.5f, 0.4f, 0.3f)));
+            }
+
+            var splats = new NativeArray<SplatRawX>(list.ToArray(), Allocator.TempJob);
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var volumes = SplatAutoPropDetector.DetectProps(splats, new AutoDetectOptions());
+                sw.Stop();
+                UnityEngine.Debug.Log($"[S2PTest] M11 自动检测:{volumes.Length} 个物件, {sw.ElapsedMilliseconds} ms, {list.Count} splats");
+                Assert.AreEqual(2, volumes.Length, "应恰好检测出 2 个独立物件(地面被结构墙过滤)");
+
+                foreach (var vol in volumes)
+                {
+                    bool isA = math.distance(vol.Volume.center, (float3)(Vector3)centerA) < math.distance(vol.Volume.center, (float3)(Vector3)centerB);
+                    float3 expectCenter = isA ? centerA : centerB;
+                    float expectYaw = isA ? 0f : math.radians(30f);
+                    float3 expectHalf = isA ? halfA : halfB;
+
+                    float3 centerErr = math.abs((float3)vol.Volume.center - expectCenter);
+                    Assert.That(centerErr.x, Is.LessThan(0.08f), $"物件质心 X 误差过大: {centerErr.x:F3}");
+                    Assert.That(centerErr.z, Is.LessThan(0.08f), $"物件质心 Z 误差过大: {centerErr.z:F3}");
+                    Assert.That(centerErr.y, Is.LessThan(0.12f), $"物件质心 Y 误差过大: {centerErr.y:F3}(底面清除带抬升)");
+
+                    float yawDelta = math.radians(vol.RotationEuler.y) - expectYaw;
+                    yawDelta = math.abs(math.atan2(math.sin(yawDelta), math.cos(yawDelta))); // wrap 到 (−π, π]
+                    Assert.That(yawDelta, Is.LessThan(math.radians(10f)),
+                        $"主轴角度误差过大: 检测 {vol.RotationEuler.y:F1}°, 期望 {math.degrees(expectYaw):F1}°");
+
+                    // 尺寸合理:体素粒度 + 旋转栅格采样误差(≤ cellSize·(cosθ+sinθ))计入容差
+                    Assert.That(vol.Volume.size.x, Is.InRange(expectHalf.x * 2f - 0.15f, expectHalf.x * 2f + 0.15f), "X 尺寸偏差过大");
+                    Assert.That(vol.Volume.size.z, Is.InRange(expectHalf.z * 2f - 0.15f, expectHalf.z * 2f + 0.15f), "Z 尺寸偏差过大");
+                }
+            }
+            finally
+            {
+                splats.Dispose();
+            }
+        }
+
+        [Test]
+        public void M11_CompoundColliderBuilder_PreservesTableCavity()
+        {
+            // 四条腿 + 桌面的凹形桌子:桌面 y∈[0.68,0.72],腿 0.06²×0.68 位于四角
+            var list = new System.Collections.Generic.List<SplatRawX>();
+            for (int lx = 0; lx < 26; ++lx)
+            for (int lz = 0; lz < 21; ++lz)
+            for (int ly = 0; ly < 2; ++ly)
+                list.Add(MakeX(new float3(-0.5f + lx * 0.04f, 0.68f + ly * 0.04f, -0.4f + lz * 0.04f), 0.02f, new float3(0.5f, 0.4f, 0.3f)));
+            foreach (float4 legPos in new[] { new float4(-1, -1, 0, 0), new float4(1, -1, 0, 0), new float4(-1, 1, 0, 0), new float4(1, 1, 0, 0) })
+            {
+                float3 cxz = new float3(legPos.x * 0.47f, 0f, legPos.y * 0.37f);
+                for (int ly = 0; ly < 18; ++ly)
+                for (int lx = 0; lx < 3; ++lx)
+                for (int lz = 0; lz < 3; ++lz)
+                    list.Add(MakeX(cxz + new float3(-0.04f + lx * 0.04f, ly * 0.04f, -0.04f + lz * 0.04f), 0.02f, new float3(0.4f, 0.4f, 0.4f)));
+            }
+
+            var splats = new NativeArray<SplatRawX>(list.ToArray(), Allocator.TempJob);
+            try
+            {
+                var boxes = SplatCompoundColliderBuilder.BuildBoxes(splats, SplatCompoundColliderBuilder.DefaultMaxBoxes, SplatCompoundColliderBuilder.DefaultGridRes);
+                UnityEngine.Debug.Log($"[S2PTest] M11 组合碰撞:{boxes.Count} 个 BoxCollider, {list.Count} splats");
+                Assert.GreaterOrEqual(boxes.Count, 2, "桌面+桌腿应至少分解为 2 个长方体");
+                Assert.LessOrEqual(boxes.Count, SplatCompoundColliderBuilder.DefaultMaxBoxes, "组合盒数不得超过上限 8");
+
+                // 凹腔未被封死:桌底中央空腔点不得落入任何碰撞盒
+                foreach (var cavity in new[] { new float3(0f, 0.2f, 0f), new float3(0f, 0.4f, 0f), new float3(0f, 0.5f, 0f), new float3(0.15f, 0.3f, 0.1f) })
+                {
+                    foreach (var box in boxes)
+                        Assert.IsFalse(box.Contains((Vector3)cavity), $"碰撞盒 {box.center} 封死了桌底空腔点 {cavity}");
+                }
+
+                // 全部 splat 应被盒组覆盖(体素量化保证)
+                int covered = 0;
+                foreach (var s in list)
+                {
+                    foreach (var box in boxes)
+                        if (box.Contains((Vector3)s.Position)) { covered++; break; }
+                }
+                Assert.GreaterOrEqual(covered, list.Count, "存在未被任何碰撞盒覆盖的 splat(体素量化丢失)");
+
+                // 确定性:同输入两次构建结果逐盒一致
+                var boxes2 = SplatCompoundColliderBuilder.BuildBoxes(splats, SplatCompoundColliderBuilder.DefaultMaxBoxes, SplatCompoundColliderBuilder.DefaultGridRes);
+                Assert.AreEqual(boxes.Count, boxes2.Count, "组合碰撞构建应确定");
+                for (int i = 0; i < boxes.Count; ++i)
+                {
+                    Assert.That((boxes2[i].center - boxes[i].center).magnitude, Is.LessThan(1e-5), $"盒 {i} 中心不一致");
+                    Assert.That((boxes2[i].size - boxes[i].size).magnitude, Is.LessThan(1e-5), $"盒 {i} 尺寸不一致");
+                }
+            }
+            finally
+            {
+                splats.Dispose();
+            }
+        }
     }
 }

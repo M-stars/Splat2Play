@@ -1,12 +1,59 @@
 // Splat2Play — M1 碰撞代理:烘焙设置与产物类型(§5.1 规格实现)
+// M11(方向 7):新增 ObbRange 有向包围盒与 PropColliderMode,DynamicPropVolume 支持旋转/碰撞模式
+// M12(方向 8):ProxyData 增加 32³ 空间材质场 SurfaceGrid
 // SPDX-License-Identifier: MIT
 
 using System;
 using System.Collections.Generic;
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace Splat2Play.Runtime
 {
+    /// <summary>
+    /// M11 T11.4:动态物件碰撞体生成模式。
+    /// SingleConvexHull:单凸包 MeshCollider(默认,兼容 M8);
+    /// CompoundBoxes:SplatCompoundColliderBuilder 凹体多长方体组合碰撞(≤ 8 个 BoxCollider,保留凹腔)。
+    /// </summary>
+    public enum PropColliderMode
+    {
+        SingleConvexHull = 0,
+        CompoundBoxes = 1
+    }
+
+    /// <summary>
+    /// M11 T11.1:有向包围盒(Burst 兼容)。Rotation/InvRotation 为 OBB 局部 ↔ 场景局部(资产局部)空间的旋转。
+    /// RotationEuler == 0 时退化为恒等旋转,Contains 的判定表达式与 M8 的 AabbRange 逐位一致。
+    /// </summary>
+    public struct ObbRange
+    {
+        public float3 Center;
+        public float3 HalfExtents;
+        public quaternion Rotation;      // OBB 局部 → 场景局部
+        public quaternion InvRotation;   // 场景局部 → OBB 局部
+
+        public static ObbRange FromBoundsAndEuler(Bounds localBounds, Vector3 eulerDeg)
+        {
+            quaternion q = quaternion.EulerXYZ(math.radians(new float3(eulerDeg.x, eulerDeg.y, eulerDeg.z)));
+            return new ObbRange
+            {
+                Center = (float3)localBounds.center,
+                HalfExtents = (float3)localBounds.extents,
+                Rotation = q,
+                InvRotation = math.conjugate(q)
+            };
+        }
+
+        public bool Contains(float3 point)
+        {
+            float3 local = math.mul(InvRotation, point - Center);
+            return math.all(math.abs(local) <= HalfExtents);
+        }
+
+        public float3 ToLocal(float3 worldPt) => math.mul(InvRotation, worldPt - Center);
+        public float3 ToWorld(float3 localPt) => Center + math.mul(Rotation, localPt);
+    }
+
     /// <summary>
     /// M5(方向 5)T5.3:烘焙计算后端。
     /// Auto:系统自动选择(支持 Compute 且 256³/512³ 且点数 ≥ 100 万时走 GPU,否则 CPU);
@@ -74,14 +121,19 @@ namespace Splat2Play.Runtime
             public Vector3 RotationEuler;
         }
 
-        /// <summary>M8 T8.1:SceneView 框选的动态物体切割盒(椅子/箱子/花瓶等独立物件)。</summary>
+        /// <summary>M8 T8.1:SceneView 框选的动态物体切割盒(椅子/箱子/花瓶等独立物件)。
+        /// M11:Volume 与 RotationEuler 共同构成 OBB 有向包围盒(Volume.center/extents 在 OBB 局部空间解释)。</summary>
         [Serializable]
         public struct DynamicPropVolume
         {
             [Tooltip("物件名称(用于生成子资产与 GameObject)")]
             public string PropName;
-            [Tooltip("扫描资产局部空间中的切割盒体")]
+            [Tooltip("切割盒体(中心/半尺寸;与 RotationEuler 组成 OBB)")]
             public Bounds Volume;
+            [Tooltip("OBB 旋转欧拉角(度);零旋转时与 M8 轴对齐行为逐位一致")]
+            public Vector3 RotationEuler;
+            [Tooltip("M11:碰撞体生成模式(单凸包 / 凹体多长方体组合)")]
+            public PropColliderMode ColliderMode;
             [Tooltip("生成的刚体质量(kg)")]
             public float Mass;
             [Tooltip("是否可被击碎(预留:当前仅施力推倒)")]
@@ -91,6 +143,8 @@ namespace Splat2Play.Runtime
             {
                 PropName = name,
                 Volume = new Bounds(Vector3.zero, Vector3.one),
+                RotationEuler = Vector3.zero,
+                ColliderMode = PropColliderMode.SingleConvexHull,
                 Mass = 5f,
                 Destructible = false
             };
@@ -130,6 +184,12 @@ namespace Splat2Play.Runtime
         public List<Bounds> ChunkBounds = new();
         [Tooltip("M4 分块剔除:对应每个非空子块内的 splat 数量。")]
         public List<int> ChunkSplatCounts = new();
+        [Tooltip("M12 空间材质场:Resolution³ 个 byte(S2PSurfaceType),按 (x + R·y + R²·z) 索引;空列表 = 未生成。")]
+        public List<byte> SurfaceGrid = new();
+        [Tooltip("M12 空间材质场覆盖范围(扫描资产局部空间)。")]
+        public Bounds SurfaceGridBounds = new(Vector3.zero, Vector3.zero);
+        [Tooltip("M12 空间材质场每轴分辨率(默认 32³ = 32KB)。")]
+        public int SurfaceGridResolution = 32;
         [Tooltip("烘焙统计与决策记录(供 benchmarks 汇总)。")]
         [TextArea(3, 8)] public string BakeLog;
     }

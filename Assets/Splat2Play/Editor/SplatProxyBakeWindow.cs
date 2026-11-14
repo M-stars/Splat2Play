@@ -2,11 +2,13 @@
 // 流程:选 PLY → 调参数 → 烘焙(进度条)→ ProxyData 落盘 → 场景装配 SplatLevel + 碰撞
 // SPDX-License-Identifier: MIT
 
+using System.Collections.Generic;
 using System.IO;
 using GaussianSplatting.Runtime;
 using Splat2Play.Runtime;
 using Unity.AI.Navigation;
 using UnityEditor;
+using UnityEditor.IMGUI.Controls;
 using UnityEngine;
 using UnityEngine.AI;
 
@@ -25,7 +27,9 @@ namespace Splat2Play.Editor
         bool _showSceneHandles = true;
         bool _replaceBackground = true;
         bool _bindAfterPrecompile = true;
+        bool _autoCompoundColliders = true;
         string _lastLog;
+        readonly List<BoxBoundsHandle> _propHandles = new(); // M11 T11.3:OBB 六面推拉手柄(按索引复用)
 
         void OnEnable() => SceneView.duringSceneGui += OnSceneGUI;
         void OnDisable() => SceneView.duringSceneGui -= OnSceneGUI;
@@ -76,6 +80,18 @@ namespace Splat2Play.Editor
                     if (GUILayout.Button("分离动态物体 (Extract Dynamic Props)", GUILayout.Height(24)))
                         ExtractDynamicProps();
                 }
+                EditorGUILayout.EndHorizontal();
+
+                // —— M11 T11.4:一键 3D 连通域 + XZ-PCA 自动物件检测 ——
+                EditorGUILayout.BeginHorizontal();
+                using (new EditorGUI.DisabledScope(!CanBake))
+                {
+                    if (GUILayout.Button("自动检测动态物体 (3D CCL + XZ-PCA)", GUILayout.Height(24)))
+                        AutoDetectProps();
+                }
+                _autoCompoundColliders = EditorGUILayout.Toggle(
+                    new GUIContent("组合碰撞 (M11 凹体多盒)", "自动检测/分离的物件用 SplatCompoundColliderBuilder 生成 ≤8 个 BoxCollider 组合碰撞,保留桌底等凹腔"),
+                    _autoCompoundColliders, GUILayout.Width(160));
                 EditorGUILayout.EndHorizontal();
                 _replaceBackground = EditorGUILayout.Toggle("分离后替换主背景为修补 PLY", _replaceBackground);
                 EditorGUILayout.LabelField(
@@ -202,21 +218,39 @@ namespace Splat2Play.Editor
                     }
                 }
 
-                // 4. DynamicProps (黄色,M8 动态物体切割盒)
+                // 4. DynamicProps (黄色,M11 OBB:BoxBoundsHandle 六面推拉 + 旋转手柄)
                 Handles.color = new Color(1f, 0.85f, 0.1f, 0.95f);
+                while (_propHandles.Count < _settings.DynamicProps.Count)
+                    _propHandles.Add(new BoxBoundsHandle
+                    {
+                        axes = PrimitiveBoundsHandle.Axes.X | PrimitiveBoundsHandle.Axes.Y | PrimitiveBoundsHandle.Axes.Z
+                    });
+                if (_propHandles.Count > _settings.DynamicProps.Count)
+                    _propHandles.RemoveRange(_settings.DynamicProps.Count, _propHandles.Count - _settings.DynamicProps.Count);
+
                 for (int i = 0; i < _settings.DynamicProps.Count; ++i)
                 {
                     var dp = _settings.DynamicProps[i];
-                    Bounds b = dp.Volume;
-                    Handles.DrawWireCube(b.center, b.size);
-                    Handles.Label(b.center + Vector3.up * (b.extents.y + 0.1f), $"Prop[{i}] {dp.PropName} ({dp.Mass:F1}kg)");
+                    Quaternion rot = Quaternion.Euler(dp.RotationEuler);
+                    BoxBoundsHandle bh = _propHandles[i];
+                    string colliderTag = dp.ColliderMode == PropColliderMode.CompoundBoxes ? "组合碰撞" : "凸包";
+                    Handles.Label(dp.Volume.center + Vector3.up * (dp.Volume.extents.y + 0.1f),
+                        $"Prop[{i}] {dp.PropName} ({dp.Mass:F1}kg, {colliderTag})");
                     EditorGUI.BeginChangeCheck();
-                    Vector3 newCenter = Handles.PositionHandle(b.center, Quaternion.identity);
-                    Vector3 newSize = Handles.ScaleHandle(b.size, newCenter, Quaternion.identity, HandleUtility.GetHandleSize(newCenter) * 0.8f);
+                    Vector3 newCenter = Handles.PositionHandle(dp.Volume.center, rot);
+                    Quaternion newRot = Handles.RotationHandle(rot, dp.Volume.center);
+                    // OBB 六面推拉手柄:在旋转局部坐标系内绘制(中心由位置手柄拖动,尺寸由六面把手调节)
+                    using (new Handles.DrawingScope(Matrix4x4.TRS(newCenter, newRot, Vector3.one)))
+                    {
+                        bh.center = Vector3.zero;
+                        bh.size = dp.Volume.size;
+                        bh.DrawHandle();
+                    }
                     if (EditorGUI.EndChangeCheck())
                     {
                         Undo.RecordObject(_settings, "Edit Dynamic Prop Volume");
-                        dp.Volume = new Bounds(newCenter, Vector3.Max(newSize, Vector3.one * 0.05f));
+                        dp.Volume = new Bounds(newCenter + newRot * bh.center, Vector3.Max(bh.size, Vector3.one * 0.05f));
+                        dp.RotationEuler = newRot.eulerAngles;
                         _settings.DynamicProps[i] = dp;
                         EditorUtility.SetDirty(_settings);
                     }
@@ -326,23 +360,14 @@ namespace Splat2Play.Editor
                         {
                             if (extraction.Props[v].Length == 0) continue;
                             float progress = 0.55f + 0.4f * v / extraction.Props.Length;
-                            EditorUtility.DisplayProgressBar("Splat2Play", $"烘焙动态物体 {extraction.PropNames[v]}…", progress);
+                            bool compound = _settings.DynamicProps[v].ColliderMode == PropColliderMode.CompoundBoxes;
+                            EditorUtility.DisplayProgressBar("Splat2Play",
+                                $"烘焙动态物体 {extraction.PropNames[v]}({(compound ? "组合碰撞" : "凸包")})…", progress);
 
                             string propPath = Path.Combine(propsDir, $"{baseName}_{extraction.PropNames[v]}.ply");
                             SplatPropExtractor.WriteBinaryPly(propPath, extraction.Props[v]);
 
-                            // 64³ 快速烘焙凸包碰撞网格(<50ms 量级)
-                            using var bake = SplatProxyBaker.Bake(propPath, propSettings);
-                            var mesh = bake.Mesh;
-                            bake.Mesh = null; // 转移 Mesh 所有权,防止 using 作用域结束时 Dispose 销毁碰撞网格
-                            mesh.name = $"S2P_Prop_{extraction.PropNames[v]}_Collision";
-
-                            string bakedDir = "Assets/Splat2Play/Baked";
-                            if (!AssetDatabase.IsValidFolder(bakedDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
-                            string meshAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedDir}/{baseName}_{extraction.PropNames[v]}_Collider.asset");
-                            AssetDatabase.CreateAsset(mesh, meshAssetPath);
-
-                            // 装配子物体:渲染器 + 凸包碰撞 + 刚体 + NavMeshObstacle
+                            // 装配子物体:渲染器 + 碰撞体 + 刚体 + NavMeshObstacle
                             Transform parent = _targetRenderer != null ? _targetRenderer.transform.parent : null;
                             var go = new GameObject($"S2P_Prop_{extraction.PropNames[v]}");
                             if (parent != null) Undo.SetTransformParent(go.transform, parent, "Splat2Play Extract Prop");
@@ -353,16 +378,40 @@ namespace Splat2Play.Editor
                             renderer.m_SourcePath = propPath; // ResolvePath 支持绝对路径
                             renderer.m_MortonReorder = true;
 
-                            var mc = go.AddComponent<MeshCollider>();
-                            mc.sharedMesh = mesh;
-                            mc.convex = true;
+                            int boxCount = 0;
+                            if (compound)
+                            {
+                                // M11 T11.5:凹体多长方体组合碰撞(保留桌底空腔等凹形)
+                                var boxes = SplatCompoundColliderBuilder.BuildBoxes(extraction.Props[v],
+                                    SplatCompoundColliderBuilder.DefaultMaxBoxes, SplatCompoundColliderBuilder.DefaultGridRes);
+                                boxCount = SplatCompoundColliderBuilder.AttachCompoundColliders(go, boxes);
+                                log.AppendLine($"[M11] 物体 {extraction.PropNames[v]}: {extraction.Props[v].Length:N0} splats, " +
+                                               $"组合碰撞 {boxCount} 盒, 质心 {(Vector3)extraction.PropCentroids[v]:F2}");
+                            }
+                            else
+                            {
+                                // 64³ 快速烘焙凸包碰撞网格(<50ms 量级)
+                                using var bake = SplatProxyBaker.Bake(propPath, propSettings);
+                                var mesh = bake.Mesh;
+                                bake.Mesh = null; // 转移 Mesh 所有权,防止 using 结束时 DestroyImmediate 销毁碰撞体网格
+                                mesh.name = $"S2P_Prop_{extraction.PropNames[v]}_Collision";
+
+                                string bakedDir = "Assets/Splat2Play/Baked";
+                                if (!AssetDatabase.IsValidFolder(bakedDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                                string meshAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedDir}/{baseName}_{extraction.PropNames[v]}_Collider.asset");
+                                AssetDatabase.CreateAsset(mesh, meshAssetPath);
+
+                                var mc = go.AddComponent<MeshCollider>();
+                                mc.sharedMesh = mesh;
+                                mc.convex = true;
+                                log.AppendLine($"[M8] 物体 {extraction.PropNames[v]}: {extraction.Props[v].Length:N0} splats, " +
+                                               $"质心 {(Vector3)extraction.PropCentroids[v]:F2}, 碰撞 {bake.TriangleCount:N0} 面");
+                            }
 
                             var prop = go.AddComponent<S2PDynamicProp>();
                             prop.SplatRenderer = renderer;
                             prop.Mass = _settings.DynamicProps[v].Mass;
                             prop.Destructible = _settings.DynamicProps[v].Destructible;
-
-                            log.AppendLine($"[M8] 物体 {extraction.PropNames[v]}: {extraction.Props[v].Length:N0} splats, 质心 {(Vector3)extraction.PropCentroids[v]:F2}, 碰撞 {bake.TriangleCount:N0} 面");
                         }
 
                         if (_replaceBackground && _targetRenderer != null)
@@ -389,6 +438,57 @@ namespace Splat2Play.Editor
             catch (System.Exception e)
             {
                 _lastLog = $"分离失败:{e.Message}";
+                Debug.LogException(e);
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+        }
+
+        /// <summary>
+        /// M11 T11.4:一键自动检测动态物体 —— 96³ 体素化 + 主地面检测 + 3D 6-邻域 CCL +
+        /// XZ 2D PCA 主轴估计,生成带最优水平旋转角的 DynamicPropVolume 列表(追加到现有列表)。
+        /// </summary>
+        void AutoDetectProps()
+        {
+            try
+            {
+                EditorUtility.DisplayProgressBar("Splat2Play", "读取扫描资产…", 0.05f);
+                var splats = SplatSourceReader.ReadAllX(_plyPath, out int splatCount, out _, out _);
+                try
+                {
+                    EditorUtility.DisplayProgressBar("Splat2Play", "3D 连通域 + XZ-PCA 自动检测…", 0.45f);
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var volumes = SplatAutoPropDetector.DetectProps(splats, new AutoDetectOptions());
+                    sw.Stop();
+
+                    Undo.RecordObject(_settings, "Splat2Play Auto Detect Props");
+                    int startIndex = _settings.DynamicProps.Count;
+                    foreach (var vol in volumes)
+                        _settings.DynamicProps.Add(vol);
+                    EditorUtility.SetDirty(_settings);
+                    SceneView.RepaintAll();
+
+                    var log = new System.Text.StringBuilder();
+                    log.AppendLine($"[M11] 自动检测 {volumes.Length} 个独立物件(耗时 {sw.ElapsedMilliseconds} ms,{splatCount:N0} splats)");
+                    for (int i = 0; i < volumes.Length; ++i)
+                    {
+                        var d = volumes[i];
+                        log.AppendLine($"[M11]   AutoProp{i + startIndex}: center={d.Volume.center:F2}, size={d.Volume.size:F2}, yaw={d.RotationEuler.y:F1}°");
+                    }
+                    if (volumes.Length == 0)
+                        log.AppendLine("[M11] 未检测到满足体积/点数约束的独立物件(可手动框选动态物体盒)");
+                    _lastLog = log.ToString();
+                }
+                finally
+                {
+                    splats.Dispose();
+                }
+            }
+            catch (System.Exception e)
+            {
+                _lastLog = $"自动检测失败:{e.Message}";
                 Debug.LogException(e);
             }
             finally

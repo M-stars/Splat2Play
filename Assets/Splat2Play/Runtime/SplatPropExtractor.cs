@@ -1,4 +1,9 @@
 // Splat2Play — M8(方向 3)T8.2:静态背景与动态子物体的 Splat 分离 + 底面空洞修补
+// M11(方向 7)T11.2:切割与底面修补升级为 OBB 有向包围盒(ObbRange):
+//   背景点先经 obb.ToLocal 变换到 OBB 局部坐标系 —— 局部空间中盒体恒为 [-E,E]³、底面恒为 y=-E,
+//   直接复用环形切片采样逻辑(y_local ∈ [-E-0.08, -E+0.08],外扩 0.20m 环带),修补点在局部底面
+//   铺设后再经 obb.ToWorld 与 obb.Rotation 变换回场景空间。
+//   RotationEuler == 0 时 ObbRange 退化为恒等旋转,Contains/采样/铺设表达式与 M8 轴对齐算法逐位一致。
 // 流程:中心落在 DynamicPropVolume 内的 splat → 剥离为独立子物体点云(局部居中);
 //       主背景在盒底执行底面邻域高斯修补(Floor Inpainting),防止物体推开后露出黑洞。
 // 算法(§5.2(2)):
@@ -64,10 +69,10 @@ namespace Splat2Play.Runtime
             bool ok = false;
             try
             {
-                var volArray = new AabbRange[propCount];
+                var volArray = new ObbRange[propCount];
                 for (int v = 0; v < propCount; ++v)
-                    volArray[v] = new AabbRange { Min = (float3)volumes[v].Volume.min, Max = (float3)volumes[v].Volume.max };
-                using var volBuf = new NativeArray<AabbRange>(volArray, Allocator.TempJob);
+                    volArray[v] = ObbRange.FromBoundsAndEuler(volumes[v].Volume, volumes[v].RotationEuler);
+                using var volBuf = new NativeArray<ObbRange>(volArray, Allocator.TempJob);
 
                 // 1. 归属标记(并行;每线程只写自己的槽位)
                 new AssignJob { Splats = splats, Volumes = volBuf, Assignment = assignment }
@@ -140,8 +145,10 @@ namespace Splat2Play.Runtime
         }
 
         /// <summary>
-        /// T8.2 底面修补:对每个切割盒,从背景 splats 采样环形框统计,在盒底足迹内铺设修补高斯,
+        /// T8.2 底面修补(M11 OBB 化):对每个切割盒(OBB),在 OBB 局部空间采样环形框统计,
+        /// 于局部底面足迹内铺设修补高斯后经 OBB 旋转/平移变换回场景空间,
         /// 追加到 background 之后(返回新数组;原数组不释放,由调用方决定去留)。
+        /// RotationEuler == 0 时与 M8 轴对齐算法逐位一致(恒等旋转 mul 为精确操作)。
         /// </summary>
         public static NativeArray<SplatRawX> InpaintFloors(NativeArray<SplatRawX> background,
                                                            ProxyBakeSettings settings, int propStartIndex = 0)
@@ -150,14 +157,18 @@ namespace Splat2Play.Runtime
             int propCount = volumes?.Count ?? 0;
             if (propCount == 0) return background;
 
+            var obbs = new ObbRange[propCount];
+            for (int v = 0; v < propCount; ++v)
+                obbs[v] = ObbRange.FromBoundsAndEuler(volumes[v].Volume, volumes[v].RotationEuler);
+
             var statsList = new InpaintStats[propCount];
             long addedTotal = 0;
             for (int v = 0; v < propCount; ++v)
             {
-                float3 volMin = (float3)volumes[v].Volume.min, volMax = (float3)volumes[v].Volume.max;
-                var stats = SampleRingStats(background, volMin, volMax);
+                var stats = SampleRingStats(background, obbs[v]);
                 statsList[v] = stats;
-                addedTotal += StepsFor(volMax.x - volMin.x, stats.Step) * StepsFor(volMax.z - volMin.z, stats.Step);
+                addedTotal += StepsFor(obbs[v].HalfExtents.x * 2f, stats.Step)
+                            * StepsFor(obbs[v].HalfExtents.z * 2f, stats.Step);
             }
             if (addedTotal == 0) return background;
 
@@ -169,20 +180,23 @@ namespace Splat2Play.Runtime
                 for (int v = 0; v < propCount; ++v)
                 {
                     var stats = statsList[v];
-                    float3 volMin = (float3)volumes[v].Volume.min, volMax = (float3)volumes[v].Volume.max;
+                    var obb = obbs[v];
+                    float ex = obb.HalfExtents.x, ez = obb.HalfExtents.z;
                     float3 scale = new float3(stats.MeanScale, 0.01f, stats.MeanScale);
-                    for (float z = volMin.z + stats.Step * 0.5f; z < volMax.z; z += stats.Step)
-                    for (float x = volMin.x + stats.Step * 0.5f; x < volMax.x; x += stats.Step)
+                    float4 rot = new float4(obb.Rotation.value.x, obb.Rotation.value.y, obb.Rotation.value.z, obb.Rotation.value.w);
+                    // OBB 局部底面(恒为 y = MeanY 层)足迹内网格铺设,再变换回场景空间
+                    for (float zl = -ez + stats.Step * 0.5f; zl < ez; zl += stats.Step)
+                    for (float xl = -ex + stats.Step * 0.5f; xl < ex; xl += stats.Step)
                     {
-                        // ±3% 确定性伪随机颜色扰动(整数哈希,无 RNG 状态依赖)
-                        uint hash = math.asuint(x * 73856093f) ^ math.asuint(z * 19349663f) ^ (uint)(propStartIndex + v) * 83492791u;
+                        // ±3% 确定性伪随机颜色扰动(整数哈希,无 RNG 状态依赖;恒等旋转下哈希输入与 M8 逐位一致)
+                        uint hash = math.asuint(xl * 73856093f) ^ math.asuint(zl * 19349663f) ^ (uint)(propStartIndex + v) * 83492791u;
                         float jitter = ((hash >> 8) & 0xFFFF) / 65535f - 0.5f; // [-0.5, 0.5]
                         float3 fdc = stats.MeanFdc * (1f + 0.06f * jitter);
                         merged[w++] = new SplatRawX
                         {
-                            Position = new float3(x, stats.MeanY, z),
+                            Position = obb.ToWorld(new float3(xl, stats.MeanY, zl)),
                             Scale = scale,
-                            Rotation = new float4(0f, 0f, 0f, 1f),
+                            Rotation = rot,
                             Opacity = kInpaintOpacity,
                             Fdc = fdc
                         };
@@ -199,7 +213,7 @@ namespace Splat2Play.Runtime
 
         struct InpaintStats
         {
-            public float MeanY;
+            public float MeanY;      // OBB 局部空间平均底面高度
             public float3 MeanFdc;
             public float MeanScale;
             public float Step;
@@ -212,29 +226,33 @@ namespace Splat2Play.Runtime
             return math.max(0, (int)math.ceil(span / step - 0.5f));
         }
 
-        /// <summary>统计环形采样框(底面切片 ±0.08m,足迹外扩 0.20m 减足迹本身)内的背景高斯均值。</summary>
-        static InpaintStats SampleRingStats(NativeArray<SplatRawX> background, float3 volMin, float3 volMax)
+        /// <summary>
+        /// 在 OBB 局部空间统计环形采样框(底面切片 ±0.08m,足迹外扩 0.20m 减足迹本身)内的背景高斯均值。
+        /// 背景点经 obb.ToLocal 变换到局部坐标后,判定逻辑与 M8 轴对齐算法逐行等价。
+        /// </summary>
+        static InpaintStats SampleRingStats(NativeArray<SplatRawX> background, ObbRange obb)
         {
             double sumY = 0, sumScale = 0;
             double3 sumFdc = 0;
             int n = 0;
-            float yLo = volMin.y - kFloorSliceHalfHeight, yHi = volMin.y + kFloorSliceHalfHeight;
+            float ex = obb.HalfExtents.x, ey = obb.HalfExtents.y, ez = obb.HalfExtents.z;
+            float yLo = -ey - kFloorSliceHalfHeight, yHi = -ey + kFloorSliceHalfHeight;
             for (int i = 0; i < background.Length; ++i)
             {
-                float3 p = background[i].Position;
+                float3 p = obb.ToLocal(background[i].Position);
                 if (p.y < yLo || p.y > yHi) continue;
-                bool inFootprintX = p.x >= volMin.x && p.x <= volMax.x;
-                bool inFootprintZ = p.z >= volMin.z && p.z <= volMax.z;
+                bool inFootprintX = p.x >= -ex && p.x <= ex;
+                bool inFootprintZ = p.z >= -ez && p.z <= ez;
                 if (inFootprintX && inFootprintZ) continue; // 只采样足迹外的环带
-                bool inRingX = p.x >= volMin.x - kRingBandWidth && p.x <= volMax.x + kRingBandWidth;
-                bool inRingZ = p.z >= volMin.z - kRingBandWidth && p.z <= volMax.z + kRingBandWidth;
+                bool inRingX = p.x >= -ex - kRingBandWidth && p.x <= ex + kRingBandWidth;
+                bool inRingZ = p.z >= -ez - kRingBandWidth && p.z <= ez + kRingBandWidth;
                 if (!(inRingX && inRingZ)) continue;
                 sumY += p.y;
                 sumFdc += background[i].Fdc;
-                sumScale += math.cmax(background[i].Scale); // 水平平均尺度用最大分量近似
+                sumScale += math.cmax(background[i].Scale); // 水平平均尺度用最大分量近似(旋转不变)
                 ++n;
             }
-            var stats = new InpaintStats { MeanY = volMin.y, MeanFdc = new float3(0.4f, 0.4f, 0.4f), MeanScale = 0.05f };
+            var stats = new InpaintStats { MeanY = -ey, MeanFdc = new float3(0.4f, 0.4f, 0.4f), MeanScale = 0.05f };
             if (n > 0)
             {
                 stats.MeanY = (float)(sumY / n);
@@ -283,12 +301,12 @@ namespace Splat2Play.Runtime
             }
         }
 
-        /// <summary>归属标记:中心点在盒内 → 物体索引;否则 = propCount(背景)。</summary>
+        /// <summary>归属标记(M11 OBB):中心点在 OBB 内 → 物体索引;否则 = propCount(背景)。</summary>
         [BurstCompile(FloatMode = FloatMode.Fast)]
         struct AssignJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<SplatRawX> Splats;
-            [ReadOnly] public NativeArray<AabbRange> Volumes;
+            [ReadOnly] public NativeArray<ObbRange> Volumes;
             [NativeDisableParallelForRestriction] public NativeArray<int> Assignment;
 
             public void Execute(int i)
