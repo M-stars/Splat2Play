@@ -80,6 +80,12 @@ namespace GaussianSplatting.Runtime
         [Tooltip("尺度/不透明度能量守恒补偿强度(0 = 不补偿,1 = 按经验系数 γscale=1.65/2.60、γα=1.35/1.75 全额补偿)")]
         [Range(0f, 1f)] public float m_LodScaleCompensation = 1f;
 
+        [Header("S2P M13 Depth Export")]
+        [Tooltip("SortedBlended 模式下导出透射率加权有效表面深度并写回相机深度(供 DoF/SSAO/屏幕空间特效与后续透明物体使用)")]
+        public bool m_WriteSplatDepth = true;
+        [Tooltip("有效表面深度判定阈值:累积 α ≥ 该阈值的像素才取 splat 深度,否则保留场景深度")]
+        [Range(0.1f, 0.9f)] public float m_SplatDepthAlphaThreshold = 0.5f;
+
         internal StochasticTemporalFilter temporalFilter => m_Transparency == TransparencyMode.Stochastic && m_RenderMode == RenderMode.Splats
             ? m_TemporalFilter : StochasticTemporalFilter.None;
 

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 Shader "Hidden/Gaussian Splatting/Composite"
 {
+Properties
+{
+    _ZWrite("ZWrite", Float) = 0 // M13:深度写回开启时由 C# 置 1
+}
 CGINCLUDE
 #pragma require compute
 #pragma use_dxc
@@ -56,12 +60,24 @@ int _S2PDynamicLightCount;
 float _S2PPerSplatLightStrength;
 float _S2PSplatNormalWeight;
 
+// —— S2P M13:透射率加权有效表面深度写回 ——
+int _S2PWriteCompositeDepth;       // 1 = composite 输出 SV_Depth 并写回相机深度(ZWrite 由 C# 置 1)
+int _S2PSplatDepthPremultiplied;   // 1 = _GaussianSplatDepthRT 为预乘 α 累积(SortedBlended),需除以累积 α
+float _S2PDepthAlphaThreshold;     // 有效表面深度判定阈值(累积 α ≥ 阈值才取 splat 深度)
+int _S2PHasSceneDepth;             // 1 = _S2PSceneDepthTexture 已绑定(URP);BiRP 未绑定时回退不取场景深度
+
 float SampleS2PDepth(int2 xy)
 {
     int3 px = int3(xy, 0);
     float d = _S2PHasSplatDepth != 0 ? _GaussianSplatDepthRT.Load(px).r : 0.0;
+    if (d > 1e-6 && _S2PSplatDepthPremultiplied != 0)
+    {
+        // M13:SortedBlended 预乘累积 D = Σ w_i·z_i → 除以累积不透明度 A = Σ w_i 得期望表面深度
+        float A = _GaussianSplatRT.Load(int3(xy, 0)).a;
+        d /= max(A, 1e-4);
+    }
     if (d <= 1e-6)
-        d = _S2PSceneDepthTexture.Load(px).r;
+        d = _S2PHasSceneDepth != 0 ? _S2PSceneDepthTexture.Load(px).r : 0.0;
     return d;
 }
 
@@ -73,7 +89,13 @@ float3 ReconstructS2PWorld(float2 pixelXY, float depth, float2 size, float proje
     return world4.xyz / max(abs(world4.w), 1e-6);
 }
 
-half4 frag (v2f i) : SV_Target
+struct CompositeFragOut
+{
+    half4 color : SV_Target;
+    float depth : SV_Depth;
+};
+
+CompositeFragOut frag (v2f i)
 {
     half4 col = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
     col.rgb = GammaToLinearSpace(col.a != 0 ? col.rgb/col.a : col.rgb);
@@ -176,7 +198,22 @@ half4 frag (v2f i) : SV_Target
             }
         }
     }
-    return float4(col.rgb, col.a);
+    // —— M13 T13.3:合成像素有效表面深度写回相机深度(SV_Depth;ZWrite 由材质 _ZWrite 控制默认关闭)——
+    // 累积 α ≥ τ 的像素取 zEff = D/A(与硬件场景深度 Reversed-Z max 融合, splat 表面必不比场景更远);
+    // 其余像素回退场景深度,避免擦除稀疏覆盖处的既有几何深度。
+    CompositeFragOut o;
+    o.color = float4(col.rgb, col.a);
+    int2 pxiOut = int2(i.vertex.xy);
+    float accumA = col.a;
+    float dSplat = _S2PHasSplatDepth != 0 ? _GaussianSplatDepthRT.Load(int3(pxiOut, 0)).r : 0.0;
+    if (dSplat > 1e-6 && _S2PSplatDepthPremultiplied != 0)
+        dSplat /= max(accumA, 1e-4);
+    float sceneDepth = _S2PHasSceneDepth != 0 ? _S2PSceneDepthTexture.Load(int3(pxiOut, 0)).r : 0.0;
+    if (_S2PWriteCompositeDepth != 0)
+        o.depth = (accumA >= _S2PDepthAlphaThreshold && dSplat > 1e-6) ? max(dSplat, sceneDepth) : sceneDepth;
+    else
+        o.depth = 1.0; // ZWrite Off 时被忽略
+    return o;
 }
 ENDCG
     SubShader
@@ -189,6 +226,7 @@ ENDCG
         Pass
         {
             Blend SrcAlpha OneMinusSrcAlpha
+            ZWrite [_ZWrite]
 CGPROGRAM
 #pragma vertex vert
 #pragma fragment frag

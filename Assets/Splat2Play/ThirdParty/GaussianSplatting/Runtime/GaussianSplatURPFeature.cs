@@ -43,6 +43,8 @@ namespace GaussianSplatting.Runtime
                 internal TextureHandle SourceDepth;
                 internal TextureHandle GaussianSplatRT;
                 internal TextureHandle GaussianSplatDepthRT;
+                internal RenderTexture SplatDepthOverride;  // M13:SortedBlended 深度导出的持久 RT(reprojected 路径不用)
+                internal bool SplatDepthExport;             // M13:SortedBlended 深度导出开关
                 internal GSRenderPass Pass;
                 internal StochasticTemporalFilter Filter;
                 internal Matrix4x4 Projection, View;
@@ -69,6 +71,7 @@ namespace GaussianSplatting.Runtime
                 var textureHandle = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, GaussianSplatRTName, true);
 
                 var filter = GaussianSplatRenderingOptions.instance.temporalFilter;
+                var options = GaussianSplatRenderingOptions.instance;
                 passData.Pass = this;
                 passData.Filter = filter;
                 passData.Projection = GL.GetGPUProjectionMatrix(cameraData.GetProjectionMatrix(), true);
@@ -77,11 +80,19 @@ namespace GaussianSplatting.Runtime
                 passData.TargetSlice = cameraData.xr.enabled ? cameraData.xr.GetTextureArraySlice() : -1;
                 passData.Width = rtDesc.width;
                 passData.Height = rtDesc.height;
+                passData.SplatDepthExport = GaussianSplatRenderSystem.SplatDepthExportEnabled(options);
+                passData.SplatDepthOverride = null;
                 if (filter == StochasticTemporalFilter.Reprojected)
                 {
                     rtDesc.graphicsFormat = GraphicsFormat.R32_SFloat;
                     passData.GaussianSplatDepthRT = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, "_GaussianSplatDepthRT", true);
                     builder.UseTexture(passData.GaussianSplatDepthRT, AccessFlags.ReadWrite);
+                }
+                else if (passData.SplatDepthExport)
+                {
+                    // M13 T13.2:SortedBlended 深度导出绑定持久 MRT 目标(reprojected 路径保持原 RG 纹理不变)
+                    var system = GaussianSplatRenderSystem.instance;
+                    passData.SplatDepthOverride = system.EnsureSplatDepthRT(rtDesc.width, rtDesc.height);
                 }
                 if (filter != StochasticTemporalFilter.None)
                 {
@@ -125,6 +136,15 @@ namespace GaussianSplatting.Runtime
                             new RenderTargetIdentifier[] { data.GaussianSplatRT, data.GaussianSplatDepthRT },
                             cameraDepth, ClearFlag.Color, Color.clear);
                     }
+                    else if (data.SplatDepthExport && data.SplatDepthOverride != null)
+                    {
+                        // M13 T13.2:SortedBlended 深度导出 —— 同样绑定 MRT 深度目标,
+                        // Front-to-Back Under 混合在该目标上累积预乘 α 深度 D = Σ w_i·z_i
+                        commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.GaussianSplatDepthRT, data.SplatDepthOverride);
+                        CoreUtils.SetRenderTarget(commandBuffer,
+                            new RenderTargetIdentifier[] { data.GaussianSplatRT, data.SplatDepthOverride },
+                            cameraDepth, ClearFlag.Color, Color.clear);
+                    }
                     else
                         CoreUtils.SetRenderTarget(commandBuffer, data.GaussianSplatRT, cameraDepth, ClearFlag.Color, Color.clear);
 
@@ -139,12 +159,44 @@ namespace GaussianSplatting.Runtime
                     }
                     RenderTargetIdentifier cameraColor = data.SourceTexture;
                     cameraColor = new RenderTargetIdentifier(cameraColor, 0, CubemapFace.Unknown, data.TargetSlice);
-                    CoreUtils.SetRenderTarget(commandBuffer, cameraColor);
+
+                    // —— S2P M13 T13.3:合成像素有效表面深度写回相机深度 ——
+                    // 场景深度先复制为 R32 副本(此刻相机深度未绑定为 DSV,无资源冲突),
+                    // 合成时以副本为 SRV 回退采样,同时把相机深度绑定为 DSV 接收 SV_Depth 写入。
+                    bool compositeDepthWrite = data.SplatDepthExport && data.Filter == StochasticTemporalFilter.None;
+                    if (compositeDepthWrite)
+                    {
+                        var scratch = system.EnsureSceneDepthScratch(data.Width, data.Height);
+                        commandBuffer.Blit(cameraDepth, scratch);
+                        commandBuffer.SetGlobalTexture("_S2PSceneDepthTexture", scratch);
+                        commandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PHasSceneDepth, 1);
+                    }
+                    else
+                    {
+                        commandBuffer.SetGlobalTexture("_S2PSceneDepthTexture", data.SourceDepth);
+                        commandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PHasSceneDepth, 1);
+                    }
+                    commandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PHasSplatDepth,
+                        data.Filter == StochasticTemporalFilter.Reprojected || data.SplatDepthExport ? 1 : 0);
+                    commandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PSplatDepthPremultiplied,
+                        data.SplatDepthExport ? 1 : 0);
+                    commandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PWriteCompositeDepth, compositeDepthWrite ? 1 : 0);
+                    commandBuffer.SetGlobalFloat(GaussianSplatRenderer.Props.S2PDepthAlphaThreshold,
+                        GaussianSplatRenderingOptions.instance.m_SplatDepthAlphaThreshold);
+                    if (compositeDepthWrite)
+                    {
+                        // 写回模式:相机深度绑定为 DSV 接收 SV_Depth;否则保持原行为(仅颜色目标)
+                        matComposite.SetFloat("_ZWrite", 1f);
+                        CoreUtils.SetRenderTarget(commandBuffer, cameraColor, cameraDepth);
+                    }
+                    else
+                    {
+                        matComposite.SetFloat("_ZWrite", 0f);
+                        CoreUtils.SetRenderTarget(commandBuffer, cameraColor);
+                    }
                     commandBuffer.SetViewport(new Rect(0, 0, data.Width, data.Height));
                     commandBuffer.SetGlobalVector("_SplatRenderSize", new Vector4(data.Width, data.Height, 0, 0));
                     commandBuffer.SetGlobalMatrix("_SplatInvViewProjection", (data.Projection * data.View).inverse);
-                    commandBuffer.SetGlobalTexture("_S2PSceneDepthTexture", data.SourceDepth);
-                    commandBuffer.SetGlobalInt("_S2PHasSplatDepth", data.Filter == StochasticTemporalFilter.Reprojected ? 1 : 0);
                     commandBuffer.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3);
                     commandBuffer.EndSample(GaussianSplatRenderSystem.s_ProfCompose);
                 });

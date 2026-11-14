@@ -1419,5 +1419,82 @@ namespace Splat2Play.Tests
                 if (mapGo != null) UnityEngine.Object.DestroyImmediate(mapGo);
             }
         }
+
+        // ==================== M13(方向 9):透射率加权有效表面深度 ====================
+
+        /// <summary>Front-to-Back Under 混合的硬件逐片段等价模拟(与 GPU 逐位同序的 float32 运算):
+        /// w_i = α_i·(1−A_prev);A += w_i;D += z_i·w_i。zEff = D / max(A, 1e-4)。</summary>
+        static (float A, float D) SimulateUnderBlend(float[] depths, float[] alphas)
+        {
+            float A = 0f, D = 0f;
+            for (int i = 0; i < depths.Length; ++i)
+            {
+                float w = alphas[i] * (1f - A);
+                D += depths[i] * w;
+                A += w;
+            }
+            return (A, D);
+        }
+
+        [Test]
+        public void M13_TransmittanceWeightedDepth_FormulaConsistency()
+        {
+            // (a) 单层不透明(α=1):zEff 必须逐位等于真实表面深度(与 Reprojected 原语义统一)
+            {
+                var (A, D) = SimulateUnderBlend(new[] { 0.42f }, new[] { 1f });
+                float zEff = D / math.max(A, 1e-4f);
+                Assert.AreEqual(0.42f, zEff, 1e-6, $"单层不透明 zEff={zEff} 应严格等于表面深度");
+                Assert.AreEqual(1f, A, 1e-6, "单层不透明累积 α 应为 1");
+            }
+
+            // (b) 多层半透明叠加:zEff 为透射率加权期望,落在前表面与最后有效层之间;
+            //     累积 α 与解析值 1 − ∏(1−α_i) 一致
+            {
+                float[] zs = { 0.20f, 0.50f, 0.90f };
+                float[] alphas = { 0.6f, 0.5f, 0.4f };
+                var (A, D) = SimulateUnderBlend(zs, alphas);
+                float zEff = D / math.max(A, 1e-4f);
+                float analyticA = 1f - (1f - 0.6f) * (1f - 0.5f) * (1f - 0.4f);
+                Assert.AreEqual(analyticA, A, 1e-5, $"累积 α={A} 应等于 1−∏(1−α_i)={analyticA}");
+                Assert.That(zEff, Is.GreaterThan(0.2f), "zEff 应大于最前层深度");
+                Assert.That(zEff, Is.LessThan(0.5f), "zEff 应小于最后有效层深度(透射率加权收敛于前景)");
+                // 解析期望:D = Σ w_i·z_i,w = (0.6, 0.5·0.4, 0.4·(1−0.8)) = (0.6, 0.2, 0.08)
+                float expectD = 0.6f * 0.2f + 0.2f * 0.5f + 0.08f * 0.9f;
+                Assert.AreEqual(expectD / 0.88f, zEff, 1e-5, $"zEff={zEff} 应严格等于透射率加权期望");
+            }
+
+            // (c) 前景收敛:前层 α → 1 时 zEff → 前表面深度(ε=0.01 内)
+            {
+                float zFront = 0.30f;
+                var (A, D) = SimulateUnderBlend(new[] { zFront, 0.55f, 0.85f }, new[] { 0.99f, 0.6f, 0.5f });
+                float zEff = D / math.max(A, 1e-4f);
+                Assert.That(math.abs(zEff - zFront), Is.LessThan(0.01f), $"前层近不透明时 zEff={zEff} 应收敛到前表面 {zFront}");
+            }
+
+            // (d) 累积上界:任意多层叠加 A ≤ 1(Under 混合的数学保证)
+            {
+                var rng = new System.Random(130913);
+                for (int trial = 0; trial < 50; ++trial)
+                {
+                    int n = 2 + rng.Next(20);
+                    var zs = new float[n];
+                    var alphas = new float[n];
+                    for (int i = 0; i < n; ++i) { zs[i] = 0.05f + 0.9f * (float)rng.NextDouble(); alphas[i] = (float)rng.NextDouble(); }
+                    var (A, _) = SimulateUnderBlend(zs, alphas);
+                    Assert.That(A, Is.LessThanOrEqualTo(1.0001f), $"trial {trial}: 累积 α 超出 1");
+                    Assert.That(A, Is.GreaterThanOrEqualTo(0f));
+                }
+            }
+
+            // (e) 有效表面深度判定阈值语义:A < τ 时合成端回退场景深度(不取 splat 深度)
+            {
+                var (A, D) = SimulateUnderBlend(new[] { 0.7f }, new[] { 0.3f });
+                float zEff = D / math.max(A, 1e-4f);
+                const float tau = 0.5f;
+                bool valid = A >= tau;
+                Assert.IsFalse(valid, "A=0.3 < τ=0.5 的稀疏覆盖像素不应取 splat 深度");
+                Assert.AreEqual(0.7f, zEff, 1e-6, "稀疏覆盖下 zEff 仍应等于该层深度(供调试对照)");
+            }
+        }
     }
 }

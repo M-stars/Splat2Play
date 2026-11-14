@@ -56,6 +56,11 @@ namespace GaussianSplatting.Runtime
         RenderTexture m_HiZPyramid;
         ComputeBuffer m_IndirectArgs;
         bool m_CullingResourceMissing;
+        // —— S2P M13 深度导出 ——
+        RenderTexture m_SplatDepthRT;       // SortedBlended 深度导出的持久 MRT 目标(R32_SFloat,验证读回用)
+        RenderTexture m_SceneDepthScratch;  // 场景深度副本(R32_SFloat):合成写回时作为 SRV 采样,规避 DSV+SRV 冲突
+        /// <summary>最近一帧的 splat 深度导出目标(无头验证用;null = 未启用)。</summary>
+        internal RenderTexture SplatDepthRT => m_SplatDepthRT;
         /// <summary>本帧 GPU 分块剔除是否生效(存在全部带分块的活跃渲染器)。</summary>
         internal bool GpuChunkCullingActive { get; private set; }
         /// <summary>本帧 GPU 剔除后的可见 splat 总数(GPU 侧精确累加,间接绘制用)。</summary>
@@ -129,6 +134,8 @@ namespace GaussianSplatting.Runtime
             Camera.onPreCull -= OnPreCullCamera;
             m_HiZPyramid?.Release(); m_HiZPyramid = null;
             m_CullingCS = null;
+            m_SplatDepthRT?.Release(); m_SplatDepthRT = null;
+            m_SceneDepthScratch?.Release(); m_SceneDepthScratch = null;
             GpuChunkCullingActive = false;
             m_TemporalAccumulator?.Dispose();
             m_TemporalAccumulator = null;
@@ -426,6 +433,66 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        // ==================== S2P M13:SortedBlended 有效表面深度导出 ====================
+
+        /// <summary>M13 深度导出条件(SortedBlended + Splats 渲染模式 + 开关开启)。</summary>
+        internal static bool SplatDepthExportEnabled(GaussianSplatRenderingOptions options)
+        {
+            return options.m_WriteSplatDepth
+                   && options.m_RenderMode == RenderMode.Splats
+                   && options.m_Transparency == TransparencyMode.SortedBlended;
+        }
+
+        /// <summary>URP 路径的持久 splat 深度导出目标(每帧 ClearFlag.Color 清零 = Reversed-Z 最远)。</summary>
+        internal RenderTexture EnsureSplatDepthRT(int width, int height)
+        {
+            if (m_SplatDepthRT != null && (m_SplatDepthRT.width != width || m_SplatDepthRT.height != height))
+            {
+                m_SplatDepthRT.Release();
+                m_SplatDepthRT = null;
+            }
+            if (m_SplatDepthRT == null)
+            {
+                var desc = new RenderTextureDescriptor(width, height, GraphicsFormat.R32_SFloat, 0)
+                {
+                    msaaSamples = 1
+                };
+                m_SplatDepthRT = new RenderTexture(desc)
+                {
+                    name = "S2P_SplatDepthRT",
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                m_SplatDepthRT.Create();
+            }
+            return m_SplatDepthRT;
+        }
+
+        /// <summary>场景深度副本(R32_SFloat):合成写回模式下作为 SRV 采样,规避相机深度 DSV+SRV 同资源冲突。</summary>
+        internal RenderTexture EnsureSceneDepthScratch(int width, int height)
+        {
+            if (m_SceneDepthScratch != null && (m_SceneDepthScratch.width != width || m_SceneDepthScratch.height != height))
+            {
+                m_SceneDepthScratch.Release();
+                m_SceneDepthScratch = null;
+            }
+            if (m_SceneDepthScratch == null)
+            {
+                var desc = new RenderTextureDescriptor(width, height, GraphicsFormat.R32_SFloat, 0)
+                {
+                    msaaSamples = 1
+                };
+                m_SceneDepthScratch = new RenderTexture(desc)
+                {
+                    name = "S2P_SceneDepthScratch",
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                m_SceneDepthScratch.Create();
+            }
+            return m_SceneDepthScratch;
+        }
+
         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
         public void CacheViewDataForAllSplats(Camera cam, CommandBuffer cmb, Matrix4x4 projection, Matrix4x4 view, int width, int height)
         {
@@ -462,6 +529,12 @@ namespace GaussianSplatting.Runtime
                                settings.m_TemporalFilter == StochasticTemporalFilter.Reprojected;
             if (reprojected) m_MatSplats.EnableKeyword("SPLAT_REPROJECTED");
             else m_MatSplats.DisableKeyword("SPLAT_REPROJECTED");
+
+            // M13 T13.2:SortedBlended 深度导出关键词(经 SV_Target1 写预乘 α 深度;
+            // Stochastic 由 SPLAT_REPROJECTED 或 ZWrite=On 直写路径覆盖,不启用本关键词)
+            bool depthExport = SplatDepthExportEnabled(settings);
+            if (depthExport) m_MatSplats.EnableKeyword("S2P_WRITE_DEPTH");
+            else m_MatSplats.DisableKeyword("S2P_WRITE_DEPTH");
 
             m_GlobalUniforms ??= new GraphicsBuffer(GraphicsBuffer.Target.Constant, 1, UnsafeUtility.SizeOf<SplatGlobalUniforms>());
             NativeArray<SplatGlobalUniforms> sgu = new(1, Allocator.Temp);
@@ -585,10 +658,11 @@ namespace GaussianSplatting.Runtime
             var options = GaussianSplatRenderingOptions.instance;
             bool temporal = options.temporalFilter != StochasticTemporalFilter.None;
             bool reprojected = options.temporalFilter == StochasticTemporalFilter.Reprojected;
+            bool depthExport = SplatDepthExportEnabled(options);
             m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatRT, -1, -1, 0, FilterMode.Point, GraphicsFormat.R16G16B16A16_SFloat);
-            if (reprojected)
+            if (reprojected || depthExport)
             {
-                // reprojection also writes splat's depth into another MRT target
+                // M13:reprojection 或 SortedBlended 深度导出均经 MRT 写出 splat 深度
                 m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatDepthRT, -1, -1, 0, FilterMode.Point, GraphicsFormat.R32_SFloat);
                 m_CommandBuffer.SetRenderTarget(m_ReprojectionTargets, BuiltinRenderTextureType.CurrentActive);
             }
@@ -599,6 +673,14 @@ namespace GaussianSplatting.Runtime
             // We only need this to determine whether we're rendering into backbuffer or not. However, detection this
             // way only works in BiRP so only do it here.
             m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.CameraTargetTexture, BuiltinRenderTextureType.CameraTarget);
+
+            // M13:splat 深度全局状态(GetTemporaryRT(nameID) 已使深度临时纹理按名全局可见;
+            // BiRP 无场景深度纹理,合成写回恒关,ZWrite 恒 Off)
+            m_CommandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PHasSplatDepth, reprojected || depthExport ? 1 : 0);
+            m_CommandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PSplatDepthPremultiplied, depthExport ? 1 : 0);
+            m_CommandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PWriteCompositeDepth, 0);
+            m_CommandBuffer.SetGlobalInt(GaussianSplatRenderer.Props.S2PHasSceneDepth, 0);
+            m_CommandBuffer.SetGlobalFloat(GaussianSplatRenderer.Props.S2PDepthAlphaThreshold, options.m_SplatDepthAlphaThreshold);
 
             // Prepare per-object ranges, then globally sort and draw.
             Material matComposite = SortAndRenderSplats(cam, m_CommandBuffer);
@@ -622,7 +704,7 @@ namespace GaussianSplatting.Runtime
             m_CommandBuffer.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3, 1);
             m_CommandBuffer.EndSample(s_ProfCompose);
             m_CommandBuffer.ReleaseTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatRT);
-            if (reprojected)
+            if (reprojected || depthExport)
                 m_CommandBuffer.ReleaseTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatDepthRT);
         }
     }
@@ -695,6 +777,8 @@ namespace GaussianSplatting.Runtime
         public GaussianSplatCameras.CameraInfo[] cameras { get; private set; } = Array.Empty<GaussianSplatCameras.CameraInfo>();
         /// <summary>M9:最近一次加载耗时(ms)。预编译直通路径为端到端(读盘+CRC+GPU 上传);异步路径到 TakeData 为止。</summary>
         public double LastLoadMilliseconds { get; private set; } = -1;
+        /// <summary>M13:最近一帧的 splat 深度导出目标(URP 路径持久 RT;null = 未启用/已完成清理)。供无头验证读回。</summary>
+        public static RenderTexture DebugSplatDepthRT => GaussianSplatRenderSystem.instance.SplatDepthRT;
 
         internal static readonly ProfilerMarker s_ProfSort = new(ProfilerCategory.Render, "GaussianSplat.Sort", MarkerFlags.SampleGPU);
 
@@ -739,6 +823,12 @@ namespace GaussianSplatting.Runtime
             public static readonly int S2PChunkVisibleFlags = Shader.PropertyToID("_S2PChunkVisibleFlags");
             // M10 Chunk HLOD
             public static readonly int S2PLodScaleComp = Shader.PropertyToID("_S2PLodScaleComp");
+            // M13 深度导出
+            public static readonly int S2PHasSplatDepth = Shader.PropertyToID("_S2PHasSplatDepth");
+            public static readonly int S2PSplatDepthPremultiplied = Shader.PropertyToID("_S2PSplatDepthPremultiplied");
+            public static readonly int S2PWriteCompositeDepth = Shader.PropertyToID("_S2PWriteCompositeDepth");
+            public static readonly int S2PHasSceneDepth = Shader.PropertyToID("_S2PHasSceneDepth");
+            public static readonly int S2PDepthAlphaThreshold = Shader.PropertyToID("_S2PDepthAlphaThreshold");
         }
 
         public int splatCount => m_SplatCount;

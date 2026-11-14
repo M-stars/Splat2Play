@@ -23,6 +23,7 @@ CGPROGRAM
 #pragma require compute
 #pragma use_dxc
 #pragma multi_compile_local __ SPLAT_REPROJECTED
+#pragma multi_compile_local __ S2P_WRITE_DEPTH
 
 #include "GaussianSplatting.hlsl"
 
@@ -103,7 +104,7 @@ uint3 pcg3d16(uint3 v)
 struct FragOutput
 {
     half4 color : SV_Target0;
-#if SPLAT_REPROJECTED
+#if SPLAT_REPROJECTED || S2P_WRITE_DEPTH
     float depth : SV_Target1;
 #endif
 };
@@ -133,8 +134,12 @@ FragOutput frag (v2f i)
     }
     FragOutput res;
     res.color = half4(i.col.rgb, alpha);
-#if SPLAT_REPROJECTED
-    res.depth = i.vertex.z;
+#if SPLAT_REPROJECTED || S2P_WRITE_DEPTH
+    // M13 T13.2:输出预乘 α 的 Reversed-Z 深度。Front-to-Back Under 混合下
+    // _GaussianSplatDepthRT 累积值 D = Σ w_i·z_i(w_i = α_i·(1−A_prev)),合成端除以
+    // 累积不透明度 A = Σ w_i 即得透射率加权期望表面深度;
+    // Stochastic 模式下 alpha 恒为 1 → res.depth = i.vertex.z,与 Reprojected 原语义 100% 统一。
+    res.depth = i.vertex.z * alpha;
 #endif
     return res;
 }
