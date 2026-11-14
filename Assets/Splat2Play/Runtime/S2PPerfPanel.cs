@@ -151,6 +151,15 @@ namespace Splat2Play.Runtime
                 lightState = spotOn ? $"{ld.Mode} (Bias={ld.Bias:F4})" : $"关闭 ({ld.Mode})";
             }
 
+            // M12:当前脚下材质(主相机向下 1.5m 处查询材质场;无材质场或相机时显示未知)
+            string surfaceStr = "未知(无材质场)";
+            var camT = Camera.main != null ? Camera.main.transform : null;
+            if (camT != null && S2PSurfaceMaterialMap.Primary != null)
+            {
+                Vector3 feet = camT.position - Vector3.up * 1.5f;
+                surfaceStr = S2PSurfaceMaterialMap.Primary.QuerySurface(feet).ToString();
+            }
+
             string precompiled = "关闭(原始路径)";
             if (SplatRenderer != null && SplatRenderer.m_PrecompiledAsset != null)
                 precompiled = $"{SplatRenderer.m_PrecompiledAsset.name} ({SplatRenderer.LastLoadMilliseconds:F1} ms 直通)";
@@ -163,6 +172,7 @@ namespace Splat2Play.Runtime
                 $"流送/剔除: {streaming}\n" +
                 $"动态光照: {lightState}\n" +
                 $"M9 预编译: {precompiled}\n" +
+                $"M12 脚下材质: {surfaceStr}\n" +
                 $"GPU缓冲估算: {_vramMb:F1} MB | 引擎内存: {totalMem} MB";
         }
 

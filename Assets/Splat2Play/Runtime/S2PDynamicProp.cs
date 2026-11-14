@@ -24,8 +24,13 @@ namespace Splat2Play.Runtime
         [Tooltip("是否可被击碎(预留)")]
         public bool Destructible;
 
+        [Header("M12 材质音效")]
+        [Tooltip("触发碰撞音效的最低相对速度(m/s)")]
+        public float MinImpactVelocity = 0.6f;
+
         Rigidbody _rb;
         NavMeshObstacle _obstacle;
+        AudioSource _impactSrc;
 
         public Rigidbody Body => _rb;
         public bool IsHeld { get; internal set; }
@@ -52,9 +57,29 @@ namespace Splat2Play.Runtime
                 var b = col.bounds.size;
                 _obstacle.size = new Vector3(Mathf.Max(0.3f, b.x), Mathf.Max(0.3f, b.y), Mathf.Max(0.3f, b.z));
             }
+
+            // M12:碰撞音效播放源(3D 空间化,复用物件位置)
+            _impactSrc = GetComponent<AudioSource>();
+            if (_impactSrc == null) _impactSrc = gameObject.AddComponent<AudioSource>();
+            _impactSrc.spatialBlend = 1f;
+            _impactSrc.minDistance = 1.5f;
+            _impactSrc.maxDistance = 25f;
         }
 
         void OnEnable() => SplatRenderer?.EnsureRegistered();
+
+        /// <summary>M12 T12.4:刚体碰撞 → 按命中点材质播放程序化音效(音量随冲击强度)。</summary>
+        void OnCollisionEnter(Collision collision)
+        {
+            float impact = collision.relativeVelocity.magnitude;
+            if (impact < MinImpactVelocity || _impactSrc == null) return;
+            Vector3 contactPos = collision.GetContact(0).point;
+            var surf = S2PSurfaceMaterialMap.QueryWorld(contactPos);
+            var clip = S2PProceduralAudio.GetClip(surf);
+            if (clip == null) return;
+            _impactSrc.pitch = 0.9f + 0.2f * ((((uint)collision.contacts.Length * 2654435761u) >> 24) & 15u) / 15f;
+            _impactSrc.PlayOneShot(clip, Mathf.Clamp(impact / 6f, 0.2f, 1f));
+        }
 
         /// <summary>抓取/释放时切换刚体状态(抓取时降低阻尼便于拖动)。</summary>
         public void SetHeld(bool held)

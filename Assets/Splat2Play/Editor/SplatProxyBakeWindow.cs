@@ -28,6 +28,7 @@ namespace Splat2Play.Editor
         bool _replaceBackground = true;
         bool _bindAfterPrecompile = true;
         bool _autoCompoundColliders = true;
+        bool _classifyMaterials = true;
         string _lastLog;
         readonly List<BoxBoundsHandle> _propHandles = new(); // M11 T11.3:OBB 六面推拉手柄(按索引复用)
 
@@ -105,6 +106,7 @@ namespace Splat2Play.Editor
             {
                 _bakeNavMesh = EditorGUILayout.Toggle("同时烘焙 NavMesh (M2)", _bakeNavMesh);
             }
+            _classifyMaterials = EditorGUILayout.Toggle("烘焙时分类 32³ 表面材质场 (M12)", _classifyMaterials);
 
             using (new EditorGUI.DisabledScope(!CanBake))
             {
@@ -528,6 +530,28 @@ namespace Splat2Play.Editor
                 proxy.ChunkBounds = result.ChunkBounds != null ? new(result.ChunkBounds) : new();
                 proxy.ChunkSplatCounts = result.ChunkSplatCounts != null ? new(result.ChunkSplatCounts) : new();
                 proxy.BakeLog = result.Log;
+
+                // M12 T12.2:烘焙时生成 32³ 空间材质场并序列化进 ProxyData(SplatLevel 装配时自动挂载查询组件)
+                if (_classifyMaterials)
+                {
+                    EditorUtility.DisplayProgressBar("Splat2Play", "分类 32³ 表面材质场…", 0.85f);
+                    var splats = SplatSourceReader.ReadAllX(_plyPath, out _, out _, out _);
+                    try
+                    {
+                        var grid = S2PSurfaceClassifier.BuildGrid(splats, S2PSurfaceClassifier.DefaultResolution);
+                        proxy.SurfaceGrid = new System.Collections.Generic.List<byte>(grid.Grid);
+                        proxy.SurfaceGridBounds = grid.GridBounds;
+                        proxy.SurfaceGridResolution = grid.Resolution;
+                        _lastLog += $"\n[M12] 材质场: Stone {grid.TypeCounts[1]:N0} | Wood {grid.TypeCounts[2]:N0} | " +
+                                    $"Metal {grid.TypeCounts[3]:N0} | Foliage {grid.TypeCounts[4]:N0} | Default {grid.TypeCounts[0]:N0}" +
+                                    $"(实心 {grid.OccupiedCells:N0} 格, 膨胀 {grid.DilatedCells:N0} 格)";
+                    }
+                    finally
+                    {
+                        splats.Dispose();
+                    }
+                }
+
                 EditorUtility.SetDirty(proxy);
                 AssetDatabase.SaveAssets();
 

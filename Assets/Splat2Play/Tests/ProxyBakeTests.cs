@@ -1326,5 +1326,98 @@ namespace Splat2Play.Tests
                 splats.Dispose();
             }
         }
+
+        // ==================== M12(方向 8):物理材质分类与材质场 ====================
+
+        [Test]
+        public void M12_SurfaceClassifier_IdentifiesAllFourMaterials()
+        {
+            // —— 直接分类断言:四类合成 splat 各自命中对应材质 ——
+            float3 Fdc(float3 c) => (c - 0.5f) / S2PSurfaceClassifier.kShC0; // c = 0.5 + kShC0·fdc 的逆变换
+            Assert.AreEqual(S2PSurfaceType.FoliageOrCarpet,
+                S2PSurfaceClassifier.ClassifySplat(Fdc(new float3(0.20f, 0.50f, 0.20f)), new float3(0.05f, 0.05f, 0.05f)),
+                "绿色低扁平散射体应为 FoliageOrCarpet");
+            Assert.AreEqual(S2PSurfaceType.Wood,
+                S2PSurfaceClassifier.ClassifySplat(Fdc(new float3(0.55f, 0.35f, 0.20f)), new float3(0.40f, 0.02f, 0.40f)),
+                "暖棕色水平板应为 Wood");
+            Assert.AreEqual(S2PSurfaceType.Metal,
+                S2PSurfaceClassifier.ClassifySplat(Fdc(new float3(0.85f, 0.85f, 0.85f)), new float3(0.50f, 0.02f, 0.50f)),
+                "高明度低饱和高扁平板应为 Metal");
+            Assert.AreEqual(S2PSurfaceType.StoneOrConcrete,
+                S2PSurfaceClassifier.ClassifySplat(Fdc(new float3(0.45f, 0.45f, 0.45f)), new float3(0.30f, 0.03f, 0.30f)),
+                "中性灰水平板应为 StoneOrConcrete");
+
+            // —— 32³ 材质场:4 个材质簇分区放置 → 查询 100% 准确 + 空白区 Default ——
+            var list = new System.Collections.Generic.List<SplatRawX>();
+            (float3 pos, float3 fdc, float3 scale, S2PSurfaceType type)[] clusters =
+            {
+                (new float3(0.6f, 0.5f, 0.6f),  Fdc(new float3(0.20f, 0.50f, 0.20f)), new float3(0.05f, 0.05f, 0.05f), S2PSurfaceType.FoliageOrCarpet),
+                (new float3(2.4f, 0.5f, 0.6f),  Fdc(new float3(0.55f, 0.35f, 0.20f)), new float3(0.40f, 0.02f, 0.40f), S2PSurfaceType.Wood),
+                (new float3(0.6f, 0.5f, 2.4f),  Fdc(new float3(0.85f, 0.85f, 0.85f)), new float3(0.50f, 0.02f, 0.50f), S2PSurfaceType.Metal),
+                (new float3(2.4f, 0.5f, 2.4f),  Fdc(new float3(0.45f, 0.45f, 0.45f)), new float3(0.30f, 0.03f, 0.30f), S2PSurfaceType.StoneOrConcrete)
+            };
+            foreach (var (pos, fdc, scale, _) in clusters)
+            {
+                for (int lz = 0; lz < 5; ++lz)
+                for (int ly = 0; ly < 5; ++ly)
+                for (int lx = 0; lx < 5; ++lx)
+                    list.Add(new SplatRawX
+                    {
+                        Position = pos + new float3(-0.12f + lx * 0.06f, -0.12f + ly * 0.06f, -0.12f + lz * 0.06f),
+                        Scale = scale,
+                        Rotation = new float4(0f, 0f, 0f, 1f),
+                        Opacity = 1f,
+                        Fdc = fdc
+                    });
+            }
+
+            var splats = new NativeArray<SplatRawX>(list.ToArray(), Allocator.TempJob);
+            GameObject mapGo = null;
+            try
+            {
+                var grid = S2PSurfaceClassifier.BuildGrid(splats, S2PSurfaceClassifier.DefaultResolution);
+                Assert.AreEqual(S2PSurfaceClassifier.DefaultResolution, grid.Resolution);
+                int totalCells = 0;
+                foreach (int cnt in grid.TypeCounts) totalCells += cnt;
+                Assert.AreEqual(32 * 32 * 32, totalCells, "五类计数之和应为全部体素数");
+                foreach (var (pos, _, _, type) in clusters)
+                    Assert.Greater(grid.TypeCounts[(int)type], 0, $"{type} 应在材质场中出现");
+
+                // 运行时查询组件:O(1) 查询各簇中心
+                mapGo = new GameObject("M12_SurfaceMap_Test");
+                var map = mapGo.AddComponent<S2PSurfaceMaterialMap>();
+                map.Resolution = grid.Resolution;
+                map.GridBounds = grid.GridBounds;
+                map.Grid = grid.Grid;
+                foreach (var (pos, _, _, type) in clusters)
+                    Assert.AreEqual(type, map.QuerySurface((Vector3)pos), $"{pos} 处应查询到 {type}");
+                // 空白区(四簇围绕的中心空置区,未膨胀波及)保持 Default
+                Assert.AreEqual(S2PSurfaceType.Default, map.QuerySurface(new Vector3(1.5f, 0.5f, 1.5f)), "空白区应为 Default");
+
+                // PhysicsMaterial 表:5 种材质均可惰性创建且属性符合表
+                foreach (S2PSurfaceType t in System.Enum.GetValues(typeof(S2PSurfaceType)))
+                {
+                    var pm = S2PSurfaceMaterialMap.GetPhysicsMaterial(t);
+                    Assert.IsNotNull(pm, $"{t} 的 PhysicsMaterial 应可创建");
+                    var props = S2PSurfacePhysics.Get(t);
+                    Assert.That(pm.staticFriction, Is.EqualTo(props.StaticFriction).Within(1e-4));
+                    Assert.That(pm.bounciness, Is.EqualTo(props.Bounciness).Within(1e-4));
+                }
+
+                // 程序化音效:5 类剪辑均可合成且为有限长度 PCM
+                foreach (S2PSurfaceType t in System.Enum.GetValues(typeof(S2PSurfaceType)))
+                {
+                    var clip = S2PProceduralAudio.GetClip(t);
+                    Assert.IsNotNull(clip, $"{t} 的程序化音效应可合成");
+                    Assert.Greater(clip.samples, 0, $"{t} 音效采样数应为正");
+                    Assert.AreEqual(1, clip.channels, "程序化音效应为单声道");
+                }
+            }
+            finally
+            {
+                splats.Dispose();
+                if (mapGo != null) UnityEngine.Object.DestroyImmediate(mapGo);
+            }
+        }
     }
 }

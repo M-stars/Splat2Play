@@ -101,6 +101,14 @@ namespace Splat2Play.Runtime
             }
 
             S2PLightProxyRegistry.RegisterShadowMesh(Proxy.CollisionMesh);
+
+            // M12 T12.3:烘焙产物含 32³ 空间材质场时自动挂载运行时材质查询组件
+            if (Proxy.SurfaceGrid != null && Proxy.SurfaceGrid.Count > 0)
+            {
+                var map = GetComponent<S2PSurfaceMaterialMap>();
+                if (map == null) map = gameObject.AddComponent<S2PSurfaceMaterialMap>();
+                map.BindFromProxy(Proxy);
+            }
         }
     }
 }
