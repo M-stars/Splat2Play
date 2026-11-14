@@ -68,6 +68,18 @@ namespace GaussianSplatting.Runtime
         [Tooltip("剔除后通过 DrawProceduralIndirect 只绘制可见实例(排序模式下精确跳过被剔除 splat)")]
         public bool m_IndirectDraw = true;
 
+        [Header("S2P M10 Chunk HLOD")]
+        [Tooltip("Chunk 级 3 档 HLOD:基于 Morton 局部性的零额外显存步进抽样(LOD0 全量 / LOD1 1/4 / LOD2 1/16),需 m_GpuChunkCulling 开启")]
+        public bool m_EnableChunkLod = false;
+        [Tooltip("LOD1 步进(1/4 抽样)起始距离(世界空间米;分块距离超过该值进入 LOD1)")]
+        public float m_Lod1Distance = 12f;
+        [Tooltip("LOD2 步进(1/16 抽样)起始距离(世界空间米)")]
+        public float m_Lod2Distance = 35f;
+        [Tooltip("帧预算(毫秒):S2PLodBudgetController 据此自适应缩放 LOD 距离(0 = 关闭自适应)")]
+        public float m_TargetFrameBudgetMs = 8f;
+        [Tooltip("尺度/不透明度能量守恒补偿强度(0 = 不补偿,1 = 按经验系数 γscale=1.65/2.60、γα=1.35/1.75 全额补偿)")]
+        [Range(0f, 1f)] public float m_LodScaleCompensation = 1f;
+
         internal StochasticTemporalFilter temporalFilter => m_Transparency == TransparencyMode.Stochastic && m_RenderMode == RenderMode.Splats
             ? m_TemporalFilter : StochasticTemporalFilter.None;
 

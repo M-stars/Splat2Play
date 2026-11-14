@@ -111,7 +111,8 @@ namespace GaussianSplatting.Runtime
                     // S2P M6:GPU 分块剔除(Hi-Z + 视锥)在绑定 cameraDepth 为 DSV 渲染目标前派发,
                     // 避免 D3D12 同一深度纹理同时作为 DSV 与 Compute SRV 读取产生状态冲突
                     commandBuffer.SetGlobalTexture("_S2PHiZSrcDepth", data.SourceDepth);
-                    system.DispatchGpuChunkCulling(commandBuffer, data.Projection, data.View, data.Width, data.Height);
+                    Vector3 camPos = data.View.inverse.GetColumn(3);
+                    system.DispatchGpuChunkCulling(commandBuffer, data.Projection, data.View, data.Width, data.Height, camPos);
 
                     commandBuffer.SetGlobalTexture(s_gaussianSplatRT, data.GaussianSplatRT);
                     commandBuffer.SetGlobalVector(GaussianSplatRenderer.Props.CameraTargetTextureTexelSize, Vector4.zero);

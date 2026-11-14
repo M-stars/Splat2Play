@@ -98,6 +98,7 @@ namespace Splat2Play.Runtime
 
             // M6:GPU 分块剔除的精确可见计数(异步读回,延迟一帧)
             string gpuCullStr = "";
+            string lodStr = "";
             if (SplatRenderer != null && SplatRenderer.GpuCullingActive)
             {
                 int vis = SplatRenderer.GpuCullingVisibleSplats;
@@ -107,6 +108,17 @@ namespace Splat2Play.Runtime
                     gpuCullStr = SplatRenderer.GpuCullingVisibleChunks >= 0
                         ? $" [GPU块 {SplatRenderer.GpuCullingVisibleChunks}/{SplatRenderer.GpuChunkCount}]"
                         : "";
+                    // M10:LOD 分档分布与光栅化缩减比(全量 = Σ chunk splat counts)
+                    if (SplatRenderer.GpuCullingLod0Chunks >= 0)
+                    {
+                        long full = 0;
+                        int chunks = SplatRenderer.GpuChunkCount;
+                        for (int c = 0; c < chunks; ++c)
+                            full += Mathf.Min(SplatGpuChunking.kChunkSize, _sourceSplats - c * SplatGpuChunking.kChunkSize);
+                        int l0 = SplatRenderer.GpuCullingLod0Chunks, l1 = SplatRenderer.GpuCullingLod1Chunks, l2 = SplatRenderer.GpuCullingLod2Chunks;
+                        string reduction = full > 0 && vis < full ? $" 缩减 {100f * (1f - vis / (float)full):F0}%" : "";
+                        lodStr = $"\nHLOD: L0 {l0} | L1 {l1} | L2 {l2} 块{reduction}";
+                    }
                 }
             }
 
@@ -139,14 +151,18 @@ namespace Splat2Play.Runtime
                 lightState = spotOn ? $"{ld.Mode} (Bias={ld.Bias:F4})" : $"关闭 ({ld.Mode})";
             }
 
+            string precompiled = "关闭(原始路径)";
+            if (SplatRenderer != null && SplatRenderer.m_PrecompiledAsset != null)
+                precompiled = $"{SplatRenderer.m_PrecompiledAsset.name} ({SplatRenderer.LastLoadMilliseconds:F1} ms 直通)";
             _text =
                 $"[Splat2Play 性能面板 (F3显隐 | F4光照 | F5记录)]\n" +
                 $"FPS: {_fps:F0}  总帧耗时: {_frameMs:F2} ms\n" +
                 $"排序: {_sortMs:F2} ms | 渲染: {_renderMs:F2} ms | 物理: {_physicsMs:F2} ms\n" +
-                $"可见/总 splat: {splat} ({sh})\n" +
+                $"可见/总 splat: {splat} ({sh}){lodStr}\n" +
                 $"代理网格: {proxy}\n" +
                 $"流送/剔除: {streaming}\n" +
                 $"动态光照: {lightState}\n" +
+                $"M9 预编译: {precompiled}\n" +
                 $"GPU缓冲估算: {_vramMb:F1} MB | 引擎内存: {totalMem} MB";
         }
 

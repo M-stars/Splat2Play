@@ -1,10 +1,11 @@
 // Splat2Play — M6(方向 1)T6.2/T6.3:GPU Chunk 级视锥 + Hi-Z 深度遮挡剔除 + 间接绘制参数
+// M10(方向 4)T10.2:CSCullChunks 增加 LOD0/1/2 距离分级 + 步进实例数精确累加(零额外显存 HLOD)
 // 管线(每相机每帧):
 //   1. CSHiZMip0       —— 相机深度 → 256×128 Hi-Z mip0(覆盖区取 min;Reversed-Z 下 min = 最远遮挡物)
 //   2. CSHiZDownsample —— 逐级 2×2 min 下采样(Reversed-Z 规则,见规格 §3.2(2))
 //   3. CSResetIndirectArgs —— 重置 DrawProceduralIndirect 参数(6, count, 0, 0)
 //   4. CSCullChunks    —— 每 Chunk:视锥测试 + 屏幕投影 AABB 对应 Mip 深度比较;
-//                         可见 Chunk 累加 splat 数到间接参数,写出可见性标志
+//                         通过后按相机距离分 LOD 档(flag 1/2/3),并累加该档位激活 splat 数到间接参数
 // SPDX-License-Identifier: MIT
 
 #pragma kernel CSHiZMip0
@@ -83,6 +84,10 @@ uint _HiZWidth;
 uint _HiZHeight;
 uint _S2PTotalSplatCount;                    // 非排序模式的回退实例数
 uint _S2PArgsUseVisibleCount;                // 1 = 排序模式,由 CSCullChunks 累加可见数
+
+// —— S2P M10:Chunk 级 3 档 HLOD ——
+float4 _S2PCamLocalPos;                      // xyz = 相机在渲染器局部空间坐标, w = lossyScale 最大分量(局部→世界距离换算)
+float4 _S2PLodParams;                        // x = lod1Dist, y = lod2Dist, z = enableLod, w = 尺度补偿强度(compute 内未使用,见 GaussianSplatUtilities)
 
 [numthreads(1, 1, 1)]
 void CSResetIndirectArgs()
@@ -188,7 +193,29 @@ void CSCullChunks(uint3 id : SV_DispatchThreadID)
     }
 #endif
 
+    // —— S2P M10 T10.2:视锥 + Hi-Z 通过后,按相机到 Chunk AABB 的最近距离选择 LOD 档位 ——
+    // flag = 1 → LOD0 全量;flag = 2 → LOD1 步进 1/4;flag = 3 → LOD2 步进 1/16
+    if (visible != 0u && _S2PLodParams.z > 0.5)
+    {
+        float3 closest = clamp(_S2PCamLocalPos.xyz, chunk.boundsMin, chunk.boundsMax);
+        float dist = length(_S2PCamLocalPos.xyz - closest) * _S2PCamLocalPos.w;
+        if (dist >= _S2PLodParams.y)
+            visible = 3u;
+        else if (dist >= _S2PLodParams.x)
+            visible = 2u;
+    }
+
     _S2PChunkVisibleFlags[c] = visible;
     if (visible != 0u)
-        InterlockedAdd(_S2PIndirectArgs[1], chunk.splatCount);
+    {
+        // 关键不变量:此处累加的激活数必须与 GaussianSplatUtilities.CSCalcViewData 中
+        // 未被 LOD 步进早退((idx & 3)==0 / (idx & 15)==0)的 splat 数逐位严格相等。
+        // kChunkSize=4096 是 4/16 的整数倍 → 全局 idx 的低位 == Chunk 内局部索引低位,两处判定天然一致。
+        uint activeCount = chunk.splatCount;
+        if (visible == 2u)
+            activeCount = (chunk.splatCount + 3u) >> 2;
+        else if (visible == 3u)
+            activeCount = (chunk.splatCount + 15u) >> 4;
+        InterlockedAdd(_S2PIndirectArgs[1], activeCount);
+    }
 }

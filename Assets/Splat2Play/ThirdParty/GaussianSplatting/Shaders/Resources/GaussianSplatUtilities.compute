@@ -57,6 +57,11 @@ uint _SHOnly;
 RWStructuredBuffer<uint> _S2PChunkVisibleFlags;
 uint _S2PUseGpuChunkCull;
 
+// —— S2P M10:Chunk HLOD 步进早退 + 代表点能量守恒补偿 ——
+// _S2PChunkVisibleFlags 值:0 = 整块剔除,1 = LOD0 全量,2 = LOD1 步进 1/4,3 = LOD2 步进 1/16
+// kChunkSize=4096 是 4/16 的整数倍 → 全局 idx 的 (idx&3)/(idx&15) 与 Chunk 内局部索引判定完全等价
+float _S2PLodScaleComp;
+
 // —— S2P M7:多光源方向性动态重光照(由 S2PLightModulationDriver 每帧注入,上限 8 盏)——
 // A: xyz=光源世界坐标, w=1/range²
 // B: xyz=朝向(单位向量), w=cos(半锥角);w < -0.999 表示点光源
@@ -137,10 +142,16 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
         return;
 
     // —— S2P M6 T6.3:所属 Chunk 被剔除 → 直接早退,跳过协方差矩阵/特征分解/球谐求值 ——
+    // —— S2P M10 T10.3:LOD 步进早退 —— flag=2 时仅保留 (idx&3)==0 的代表点;flag=3 仅保留 (idx&15)==0
+    uint lodFlag = 1u;
     if (_S2PUseGpuChunkCull != 0)
     {
         uint chunkIdx = idx >> 12; // 4096 splats per chunk
-        if (_S2PChunkVisibleFlags[chunkIdx] == 0)
+        lodFlag = _S2PChunkVisibleFlags[chunkIdx];
+        bool lodCulled = (lodFlag == 0u)
+                      || (lodFlag == 2u && ((idx & 3u) != 0u))
+                      || (lodFlag == 3u && ((idx & 15u) != 0u));
+        if (lodCulled)
         {
             SplatViewData culledView = (SplatViewData)0;
             culledView.pos.x = asfloat(0x7f800000u); // NaN,顶点着色器自动丢弃退化三角形
@@ -163,6 +174,15 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
     float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
     half opacityScale = _SplatOpacityScale;
     float splatScale = _SplatScale;
+
+    // —— S2P M10:代表点尺度/不透明度能量守恒补偿(γscale: K=4→1.65, K=16→2.60;γα: K=4→1.35, K=16→1.75)
+    // 未补偿时远景墙面会出现网状孔洞或变淡;补偿强度 _S2PLodScaleComp ∈ [0,1](0 = 无补偿)。
+    // 注意 _S2PLodScaleComp=0 时 lerp 结果精确为 1.0,乘法为 IEEE 恒等操作,不改变 LOD0/未启用 LOD 的行为。
+    if (_S2PLodScaleComp > 0.0 && lodFlag > 1u)
+    {
+        splatScale *= lerp(1.0, lodFlag == 2u ? 1.65 : 2.60, _S2PLodScaleComp);
+        opacityScale = (half)(opacityScale * lerp(1.0, lodFlag == 2u ? 1.35 : 1.75, _S2PLodScaleComp));
+    }
 
     view.pos.x = asfloat(0x7f800000u); // culled unless a visible center is written below
     bool behindCam = centerClipPos.w <= 0;

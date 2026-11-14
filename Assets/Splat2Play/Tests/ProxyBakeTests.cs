@@ -1054,5 +1054,62 @@ namespace Splat2Play.Tests
                 if (File.Exists(binPath)) File.Delete(binPath);
             }
         }
+
+        // ==================== M10(方向 4):Chunk 级步进 HLOD ====================
+
+        [Test]
+        public void M10_StridedChunkLod_CountsMatchExactly()
+        {
+            // CSCullChunks 的 InterlockedAdd 累加公式 (Nc+3)>>2 / (Nc+15)>>4
+            // 必须与 CSCalcViewData 的逐点判定 (i&3)==0 / (i&15)==0 计数严格相等(误差 0),
+            // 否则 _S2PIndirectArgs[1] 会多画或漏画可见 splat。
+            foreach (int nc in new[] { 1, 3, 4, 15, 16, 17, 1234, 4096 })
+            {
+                int loopLod1 = 0, loopLod2 = 0;
+                for (int i = 0; i < nc; ++i)
+                {
+                    if ((i & 3) == 0) ++loopLod1;
+                    if ((i & 15) == 0) ++loopLod2;
+                }
+                int formulaLod1 = (nc + 3) >> 2;
+                int formulaLod2 = (nc + 15) >> 4;
+                Assert.AreEqual(loopLod1, formulaLod1, $"Nc={nc}: LOD1 公式与逐点计数不一致");
+                Assert.AreEqual(loopLod2, formulaLod2, $"Nc={nc}: LOD2 公式与逐点计数不一致");
+                Assert.GreaterOrEqual(formulaLod1, 1, "至少保留第 0 个代表点");
+                Assert.LessOrEqual(formulaLod2, formulaLod1, "LOD2 激活数不得多于 LOD1");
+                Assert.LessOrEqual(formulaLod1, nc, "激活数不得超过 chunk splat 数");
+            }
+
+            // 精确恒等验证:每个 Chunk 大小都逐位核对公式 = 逐点判定(全量枚举 1..4096,计数器校验)
+            int mismatches = 0;
+            for (int nc = 1; nc <= 4096; ++nc)
+            {
+                int formula = (nc + 3) >> 2;
+                int loop = 0;
+                for (int i = 0; i < nc; ++i)
+                    if ((i & 3) == 0) ++loop;
+                if (loop != formula) ++mismatches;
+            }
+            Assert.AreEqual(0, mismatches, "LOD1 公式与逐点计数在 1..4096 全量枚举中必须零失配");
+
+            // 不变量:kChunkSize=4096 是 4/16 的整数倍 → 全局 idx 的低位 == Chunk 内局部索引低位。
+            // CSCalcViewData 用全局 idx 判定、CSCullChunks 用 Chunk 内计数累加,两者必须指向同一批 splat。
+            int invariantViolations = 0;
+            foreach (int start in new[] { 0, 4096, 8192, 12288, 507904 })
+            {
+                for (int local = 0; local < 4096; ++local)
+                {
+                    long idx = start + local;
+                    if ((local & 3) != (int)(idx & 3) || (local & 15) != (int)(idx & 15))
+                        ++invariantViolations;
+                }
+            }
+            Assert.AreEqual(0, invariantViolations, "4096 对齐 Chunk 起点下 (idx&3)/(idx&15) 必须与局部索引完全等价");
+
+            // 预期缩减比:LOD1 ≈ 25%、LOD2 ≈ 6.25%(供 benchmarks 对照)
+            const int N = 4096;
+            Assert.AreEqual(N / 4, (N + 3) >> 2, "4096 点 LOD1 应精确激活 1024 个");
+            Assert.AreEqual(N / 16, (N + 15) >> 4, "4096 点 LOD2 应精确激活 256 个");
+        }
     }
 }

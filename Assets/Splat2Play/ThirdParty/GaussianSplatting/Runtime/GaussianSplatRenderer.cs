@@ -311,9 +311,10 @@ namespace GaussianSplatting.Runtime
         /// 在 CalcViewData 之前调用:构建 Hi-Z 金字塔(Reversed-Z 取 Min),
         /// 逐渲染器派发 CSCullChunks(视锥 + 屏幕投影 AABB 深度比较),并重置/累加间接绘制参数。
         /// 调用方(URP Feature)需先将相机深度纹理绑定为全局 "_S2PHiZSrcDepth"。
+        /// M10:camWorldPos 用于 Chunk HLOD 距离分级(相机 → 渲染器局部空间)。
         /// </summary>
         internal void DispatchGpuChunkCulling(CommandBuffer cmb, Matrix4x4 gpuProjection, Matrix4x4 viewMatrix,
-                                              int camWidth, int camHeight)
+                                              int camWidth, int camHeight, Vector3 camWorldPos)
         {
             GpuChunkCullingActive = false;
             GpuCullingVisibleSplatTotal = -1;
@@ -360,10 +361,12 @@ namespace GaussianSplatting.Runtime
             // 3. 逐渲染器剔除(局部 AABB 经 VP*O2W 组合矩阵变换到裁剪空间)
             Matrix4x4 viewProj = gpuProjection * viewMatrix;
             m_CullingCS.GetKernelThreadGroupSizes(kKernelCullChunks, out uint groupSize, out _, out _);
+            bool lodEnabled = options.m_EnableChunkLod;
             bool any = false;
             foreach (var (gs, _) in m_ActiveSplats)
             {
-                cmb.SetComputeMatrixParam(m_CullingCS, "_S2PCullMatrixVP", viewProj * gs.transform.localToWorldMatrix);
+                var tr = gs.transform;
+                cmb.SetComputeMatrixParam(m_CullingCS, "_S2PCullMatrixVP", viewProj * tr.localToWorldMatrix);
                 cmb.SetComputeBufferParam(m_CullingCS, kKernelCullChunks, "_S2PGpuChunks", gs.GpuChunkBuffer);
                 cmb.SetComputeBufferParam(m_CullingCS, kKernelCullChunks, "_S2PChunkVisibleFlags", gs.GpuChunkFlagsBuffer);
                 cmb.SetComputeBufferParam(m_CullingCS, kKernelCullChunks, "_S2PIndirectArgs", m_IndirectArgs);
@@ -371,6 +374,15 @@ namespace GaussianSplatting.Runtime
                 cmb.SetComputeIntParam(m_CullingCS, "_ChunkCount", gs.GpuChunkCount);
                 cmb.SetComputeIntParam(m_CullingCS, "_HiZWidth", kHiZWidth);
                 cmb.SetComputeIntParam(m_CullingCS, "_HiZHeight", kHiZHeight);
+                // M10:相机 → 渲染器局部空间 + lossyScale 最大分量(局部距离 ≈ 世界距离的换算系数)
+                Vector3 camLocal = tr.worldToLocalMatrix.MultiplyPoint3x4(camWorldPos);
+                Vector3 lossy = tr.lossyScale;
+                float maxScale = Mathf.Max(Mathf.Abs(lossy.x), Mathf.Max(Mathf.Abs(lossy.y), Mathf.Abs(lossy.z)));
+                cmb.SetComputeVectorParam(m_CullingCS, "_S2PCamLocalPos",
+                    new Vector4(camLocal.x, camLocal.y, camLocal.z, Mathf.Max(maxScale, 1e-4f)));
+                cmb.SetComputeVectorParam(m_CullingCS, "_S2PLodParams",
+                    new Vector4(options.m_Lod1Distance, options.m_Lod2Distance, lodEnabled ? 1f : 0f,
+                        lodEnabled ? options.m_LodScaleCompensation : 0f));
                 cmb.DispatchCompute(m_CullingCS, kKernelCullChunks,
                     (gs.GpuChunkCount + (int)groupSize - 1) / (int)groupSize, 1, 1);
                 any = true;
@@ -654,8 +666,14 @@ namespace GaussianSplatting.Runtime
             m_ChunkVisibleFlags != null && GaussianSplatRenderingOptions.instance.m_GpuChunkCulling;
         /// <summary>最近一次完成的 GPU 剔除可见 Chunk 数(-1 = 尚无数据,延迟一帧)。</summary>
         public int GpuCullingVisibleChunks { get; private set; } = -1;
-        /// <summary>最近一次完成的 GPU 剔除后参与排序/光栅化的精确 splat 数(-1 = 尚无数据)。</summary>
+        /// <summary>最近一次完成的 GPU 剔除后参与排序/光栅化的精确 splat 数(-1 = 尚无数据;M10 LOD 激活时为各档激活数之和)。</summary>
         public int GpuCullingVisibleSplats { get; private set; } = -1;
+        /// <summary>M10:最近一次读回的 LOD0(全量)Chunk 数(-1 = 尚无数据)。</summary>
+        public int GpuCullingLod0Chunks { get; private set; } = -1;
+        /// <summary>M10:最近一次读回的 LOD1(1/4 步进)Chunk 数。</summary>
+        public int GpuCullingLod1Chunks { get; private set; } = -1;
+        /// <summary>M10:最近一次读回的 LOD2(1/16 步进)Chunk 数。</summary>
+        public int GpuCullingLod2Chunks { get; private set; } = -1;
         internal GraphicsBuffer GpuChunkBuffer => m_GpuChunks;
         internal GraphicsBuffer GpuChunkFlagsBuffer => m_ChunkVisibleFlags;
 
@@ -719,6 +737,8 @@ namespace GaussianSplatting.Runtime
             // M6 GPU 分块剔除
             public static readonly int S2PUseGpuChunkCull = Shader.PropertyToID("_S2PUseGpuChunkCull");
             public static readonly int S2PChunkVisibleFlags = Shader.PropertyToID("_S2PChunkVisibleFlags");
+            // M10 Chunk HLOD
+            public static readonly int S2PLodScaleComp = Shader.PropertyToID("_S2PLodScaleComp");
         }
 
         public int splatCount => m_SplatCount;
@@ -801,6 +821,9 @@ namespace GaussianSplatting.Runtime
             m_ChunkSplatCounts = null;
             GpuCullingVisibleChunks = -1;
             GpuCullingVisibleSplats = -1;
+            GpuCullingLod0Chunks = -1;
+            GpuCullingLod1Chunks = -1;
+            GpuCullingLod2Chunks = -1;
         }
 
         /// <summary>M6:请求分块可见性标志异步读回(延迟一帧的精确可见计数,缓冲极小)。</summary>
@@ -823,14 +846,23 @@ namespace GaussianSplatting.Runtime
             int chunkCount = m_ChunkSplatCounts != null ? m_ChunkSplatCounts.Length : 0;
             int visChunks = 0;
             long visSplats = 0;
+            int lod0 = 0, lod1 = 0, lod2 = 0;
             for (int i = 0; i < data.Length && i < chunkCount; ++i)
             {
-                if (data[i] == 0) continue;
+                uint flag = data[i];
+                if (flag == 0) continue;
                 ++visChunks;
-                visSplats += m_ChunkSplatCounts[i];
+                int cnt = m_ChunkSplatCounts[i];
+                // M10:LOD 档位激活数与 CSCullChunks 累加公式一致((Nc+3)>>2 / (Nc+15)>>4)
+                if (flag == 2)      { visSplats += (cnt + 3) >> 2;  ++lod1; }
+                else if (flag == 3) { visSplats += (cnt + 15) >> 4; ++lod2; }
+                else                { visSplats += cnt;             ++lod0; }
             }
             GpuCullingVisibleChunks = visChunks;
             GpuCullingVisibleSplats = (int)visSplats;
+            GpuCullingLod0Chunks = lod0;
+            GpuCullingLod1Chunks = lod1;
+            GpuCullingLod2Chunks = lod2;
         }
 
         bool resourcesAreSetUp => GaussianSplatRenderingOptions.instance.resourcesFound;
@@ -1015,7 +1047,13 @@ namespace GaussianSplatting.Runtime
             bool chunkCull = GaussianSplatRenderingOptions.instance.m_GpuChunkCulling && m_ChunkVisibleFlags != null;
             cmb.SetComputeIntParam(cs, Props.S2PUseGpuChunkCull, chunkCull ? 1 : 0);
             if (chunkCull)
+            {
                 cmb.SetComputeBufferParam(cs, kKernelCalcViewData, Props.S2PChunkVisibleFlags, m_ChunkVisibleFlags);
+                // M10:LOD 代表点尺度/不透明度补偿强度(LOD 未启用时置 0,核内 lerp 恒等)
+                var lodOptions = GaussianSplatRenderingOptions.instance;
+                cmb.SetComputeFloatParam(cs, Props.S2PLodScaleComp,
+                    lodOptions.m_EnableChunkLod ? lodOptions.m_LodScaleCompensation : 0f);
+            }
 
             cs.GetKernelThreadGroupSizes(kKernelCalcViewData, out uint gsX, out _, out _);
             cmb.DispatchCompute(cs, kKernelCalcViewData, (m_SplatCount + (int)gsX - 1)/(int)gsX, 1, 1);
