@@ -1018,8 +1018,8 @@ namespace Splat2Play.Tests
                 long fileSize = new FileInfo(binPath).Length;
                 Assert.AreEqual(64 + hdr.PayloadBytes, (uint)fileSize, "64B 头 + 四路载荷");
 
-                // —— 读回:四路数组与原数组逐位 100% 相等 ——
-                using var loaded = GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadPayload(binPath, asset);
+                // —— 读回:四路数组与原数组逐位 100% 相等(含全量 CRC32 校验)——
+                using var loaded = GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadPayload(binPath, asset, verifyCrc: true);
                 Assert.AreEqual(count, loaded.count);
                 var gotPos = loaded.positions.ToArray();
                 var gotGeo = loaded.geometry.ToArray();
@@ -1035,12 +1035,12 @@ namespace Splat2Play.Tests
                 for (int i = 0; i < expSh.Length; ++i)
                     Assert.AreEqual(expSh[i], gotSh[i], $"sh[{i}] 不一致");
 
-                // —— 损坏检测:翻转载荷一个字节 → CRC 校验必须失败 ——
+                // —— 损坏检测:翻转载荷一个字节 → CRC 校验必须失败(校验路径)——
                 byte[] corrupted = File.ReadAllBytes(binPath);
                 corrupted[64 + 777] ^= 0xFF;
                 File.WriteAllBytes(binPath, corrupted);
                 Assert.Throws<InvalidDataException>(() =>
-                    GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadPayload(binPath, asset), "CRC 必须拦截载荷损坏");
+                    GaussianSplatting.Runtime.SplatAssetPrecompiler.ReadPayload(binPath, asset, verifyCrc: true), "CRC 必须拦截载荷损坏");
 
                 // —— 魔数检测 ——
                 corrupted[0] = 0x00;

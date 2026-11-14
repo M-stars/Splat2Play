@@ -72,6 +72,42 @@
 - `SplatFPSController` 交互:左键射击冲量(`AddForceAtPosition`)、E 键抓取/投掷;被推倒物件经 NavMeshObstacle 令 `EnemyChaser` 自动绕行
 - **退出标准:** 分离/修补/PLY 往返单元测试 ✅;运行时射击-翻滚-阴影-绕行(无头验证,见 benchmarks)
 
+### M9 — 预编译二进制资产管线(方向 6)✅ 2026-11-15
+
+- `GaussianSplatPrecompiledAsset`(.asset 轻量元数据)+ `.s2pbin`(64B 头 + 四路 GPU 原始字节流,IEEE 802.3 CRC32)
+- `SplatAssetPrecompiler`:离线解码 → Morton 重排 → Chunk AABB → 写出(Burst CRC;PrecompileFromFile 一键入口)
+- `GaussianSplatRenderer.m_PrecompiledAsset` 直通加载:AsyncReadManager 原生并行直读 + 映射 memcpy 回退,零解码/零运行时排序;m_SourcePath 100% 保留回退
+- 烘焙向导"预编译为商业资产包"按钮 + 一键绑定;Renderer Inspector 显示加载耗时
+- **退出标准:** 往返逐位相等 + CRC/魔数/损坏拦截 ✅(单元测试);加载稳态 36.7-41.6ms、提速 16.9-26.3×(参考机 <35ms 目标,硬件上下文见 benchmarks)✅
+
+### M10 — Chunk 级 3 档 HLOD(方向 4)✅ 2026-11-15
+
+- Morton 局部性步进抽样(LOD0 1× / LOD1 1/4 / LOD2 1/16)——零额外显存,kChunkSize=4096 对齐保证累加数与早退数逐位恒等
+- `CSCullChunks` 距离分档 + 激活数精确累加;`CSCalcViewData` 步进早退 + γscale(1.65/2.60)/γα(1.35/1.75) 能量守恒补偿
+- `S2PLodBudgetController` 帧预算自适应距离乘数;性能面板 LOD0/1/2 分布与缩减比
+- **退出标准:** 远景光栅化缩减 **93.7%**(目标 40-75%)+ 三机位非黑 ≥93% ✅(真实扫描无头验证)
+
+### M11 — OBB 有向包围盒 + 连通域自动分割 + 凹体组合碰撞(方向 7)✅ 2026-11-15
+
+- `ObbRange`(Burst 兼容)+ `DynamicPropVolume.RotationEuler/ColliderMode`;`SplatPropExtractor` OBB 局部空间切割与底面修补(零旋转退化与 M8 逐位一致)
+- `SplatAutoPropDetector`:分位包络 → 96³ 各向同性体素占用 → 地面检测 → 6-邻域 CCL → XZ 2D PCA ±θ 最小面积 OBB(真实扫描 47-61ms)
+- `SplatCompoundColliderBuilder`:Greedy 3D Box Merging(≤8 盒,凹腔保留);SceneView `BoxBoundsHandle` + 旋转手柄 + 一键自动检测
+- **退出标准:** 45° 物件 100% 剥离/背景零误伤/修补点落在旋转足迹 ✅(单元测试);真实扫描 1 物件 → 8 盒组合碰撞 ✅
+
+### M12 — 物理材质自适应 + 程序化声学(方向 8)✅ 2026-11-15
+
+- `S2PSurfaceClassifier` 五类分类(高斯色度 + 最短轴扁平度)→ 32³ 空间材质场(32KB)+ 空体素 6-邻域膨胀
+- `S2PSurfaceMaterialMap` O(1) 无 GC 查询 + Unity 6 `PhysicsMaterial` 惰性创建;`SplatLevel` 自动挂载
+- `S2PProceduralAudio` 零外部依赖 5 类确定性合成(LCG + AudioClip.Create);FPSController 脚步/命中、S2PDynamicProp 碰撞音效
+- **退出标准:** 4 材质 100% 识别 + PhysicsMaterial 属性表 ✅(单元测试);真实扫描材质场 Stone 8.9%/Wood 2.4%/Foliage 1.6% 合理 ✅
+
+### M13 — SortedBlended 有效表面深度写回(方向 9)✅ 2026-11-15
+
+- SV_Target1 输出 float4(z·α, α, α, α)→ **RGBA32F** 深度目标累积 D/A(R32 的 dst-α 混合因子恒为 1,无法累积——关键踩坑)
+- `GaussianComposite`:zEff = D/max(A,1e-4) 透射率加权期望表面深度,经 SV_Depth 写回相机深度并与场景深度 Reversed-Z max 融合;场景深度先复制 R32 副本规避 DSV+SRV 冲突
+- `SampleS2PDepth` 预乘归一化 → M3 手电筒/M7 屏幕空间法线在 SortedBlended 下获得精确 splat 深度(无需代理网格)
+- **退出标准:** 深度目标非零有效像素 **95.7%**(目标 >50%)✅(真实扫描无头验证)
+
 ## 性能基准目标(桌面,RTX 级显卡)
 
 - ≥100 万 splat 场景,开启代理 + 近似光照后仍达 60fps

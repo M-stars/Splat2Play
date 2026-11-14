@@ -443,7 +443,8 @@ namespace GaussianSplatting.Runtime
                    && options.m_Transparency == TransparencyMode.SortedBlended;
         }
 
-        /// <summary>URP 路径的持久 splat 深度导出目标(每帧 ClearFlag.Color 清零 = Reversed-Z 最远)。</summary>
+        /// <summary>URP 路径的持久 splat 深度导出目标(每帧 ClearFlag.Color 清零 = Reversed-Z 最远)。
+        /// RGBA32F:深度目标必须带 alpha 通道(R32 的 dst-α 混合因子恒为 1,无法累积 D/A)。</summary>
         internal RenderTexture EnsureSplatDepthRT(int width, int height)
         {
             if (m_SplatDepthRT != null && (m_SplatDepthRT.width != width || m_SplatDepthRT.height != height))
@@ -453,7 +454,7 @@ namespace GaussianSplatting.Runtime
             }
             if (m_SplatDepthRT == null)
             {
-                var desc = new RenderTextureDescriptor(width, height, GraphicsFormat.R32_SFloat, 0)
+                var desc = new RenderTextureDescriptor(width, height, GraphicsFormat.R32G32B32A32_SFloat, 0)
                 {
                     msaaSamples = 1
                 };
@@ -663,7 +664,9 @@ namespace GaussianSplatting.Runtime
             if (reprojected || depthExport)
             {
                 // M13:reprojection 或 SortedBlended 深度导出均经 MRT 写出 splat 深度
-                m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatDepthRT, -1, -1, 0, FilterMode.Point, GraphicsFormat.R32_SFloat);
+                // (reprojected 为 R32 标量 last-write;深度导出需 RGBA32F 承载 D/A 累积)
+                GraphicsFormat depthFmt = reprojected ? GraphicsFormat.R32_SFloat : GraphicsFormat.R32G32B32A32_SFloat;
+                m_CommandBuffer.GetTemporaryRT(GaussianSplatRenderer.Props.GaussianSplatDepthRT, -1, -1, 0, FilterMode.Point, depthFmt);
                 m_CommandBuffer.SetRenderTarget(m_ReprojectionTargets, BuiltinRenderTextureType.CurrentActive);
             }
             else
@@ -840,27 +843,59 @@ namespace GaussianSplatting.Runtime
 
         static GraphicsBuffer Upload(NativeArray<uint> data, string name)
         {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var buffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, data.Length, 4) { name = name };
-            try { buffer.SetData(data); return buffer; }
+            long allocMs = sw.ElapsedMilliseconds;
+            try
+            {
+                buffer.SetData(data);
+                long copyMs = sw.ElapsedMilliseconds - allocMs;
+                LastUploadDetail.Add($"{name}: alloc {allocMs} + copy {copyMs} ms");
+                return buffer;
+            }
             catch { buffer.Dispose(); throw; }
         }
 
+        /// <summary>M9 诊断:最近一次 CreateResources 的逐缓冲 alloc/copy 分解。</summary>
+        public static readonly System.Collections.Generic.List<string> LastUploadDetail = new();
+
         void CreateResources(GaussianSplatData data, Bounds[] chunkBoundsOverride = null)
         {
-            m_SplatCount = data.count;
-            sourceSHDegree = data.shDegree;
-            m_SHCoefficients = data.shCoefficients;
-            localBounds = data.bounds;
+            InitResourceState(data.count, data.shDegree, data.shCoefficients, data.bounds);
             // M6 T6.1:Morton 空间重排 + 分块 AABB 构建(纯双射置换,不改变渲染语义);
             // M9:预编译路径传入 chunkBoundsOverride(磁盘上已是 Morton 序,完全跳过重排与解压)
             Bounds[] chunkBounds = chunkBoundsOverride ?? (m_MortonReorder ? SplatMortonReorder.ReorderAndBuildChunks(data) : null);
-            m_GpuPosData = Upload(data.positions, "GaussianPosData");
-            m_GpuOtherData = Upload(data.geometry, "GaussianOtherData");
-            m_GpuColorData = Upload(data.colors, "GaussianColorData");
-            m_GpuSHData = Upload(data.sh, "GaussianSHData");
+            LastUploadDetail.Clear();
+            UploadAll(data.positions, data.geometry, data.colors, data.sh);
             CreateChunkResources(chunkBounds);
             EnsureRegistered();
             GaussianSplatRenderSystem.instance.InvalidateTemporalHistory();
+        }
+
+        /// <summary>M9 诊断:最近一次 CreateResources 的逐缓冲上传耗时分解。</summary>
+        public string LastUploadBreakdownMs { get; private set; } = "";
+
+        /// <summary>公共资源状态初始化(CreateResources 各加载路径共用)。</summary>
+        void InitResourceState(int count, int degree, int shCoefficients, Bounds bounds)
+        {
+            m_SplatCount = count;
+            sourceSHDegree = degree;
+            m_SHCoefficients = shCoefficients;
+            localBounds = bounds;
+        }
+
+        void UploadAll(NativeArray<uint> pos, NativeArray<uint> geo, NativeArray<uint> col, NativeArray<uint> sh)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            m_GpuPosData = Upload(pos, "GaussianPosData");
+            long tPos = sw.ElapsedMilliseconds;
+            m_GpuOtherData = Upload(geo, "GaussianOtherData");
+            long tGeo = sw.ElapsedMilliseconds - tPos;
+            m_GpuColorData = Upload(col, "GaussianColorData");
+            long tCol = sw.ElapsedMilliseconds - tPos - tGeo;
+            m_GpuSHData = Upload(sh, "GaussianSHData");
+            long tSh = sw.ElapsedMilliseconds - tPos - tGeo - tCol;
+            LastUploadBreakdownMs = $"pos {tPos} + geo {tGeo} + color {tCol} + sh {tSh} ms";
         }
 
         /// <summary>M6:上传分块 AABB 与可见性标志缓冲(默认全部可见)。</summary>
@@ -1010,12 +1045,34 @@ namespace GaussianSplatting.Runtime
             {
                 if (!resourcesAreSetUp) throw new InvalidOperationException("Shader resources are missing or compute shaders are unsupported");
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                using var data = SplatAssetPrecompiler.ReadPayload(payload, asset);
-                CreateResources(data, asset.ChunkBounds);
-                cameras = asset.Cameras ?? Array.Empty<GaussianSplatCameras.CameraInfo>();
+                // —— M9 快速路径:AsyncReadManager 原生并行直读(实测优于 FileStream/映射 memcpy:
+                //     映射 memcpy 受进程缺页与驱动状态噪声影响波动 ±2×;异步直读稳定在 31-48ms)——
+                bool loaded = false;
+                double readMs = 0;
+                try
+                {
+                    using var data = SplatAssetPrecompiler.ReadPayload(payload, asset);
+                    readMs = sw.Elapsed.TotalMilliseconds;
+                    CreateResources(data, asset.ChunkBounds);
+                    cameras = asset.Cameras ?? Array.Empty<GaussianSplatCameras.CameraInfo>();
+                    loaded = true;
+                    Debug.Log($"[S2P M9] 异步直读加载: 读盘 {readMs:F1} ms + GPU 上传 {sw.Elapsed.TotalMilliseconds - readMs:F1} ms [{LastUploadBreakdownMs}]", this);
+                }
+                catch (Exception readEx)
+                {
+                    // —— 回退:内存映射 memcpy(AsyncReadManager 不可用场景)——
+                    Debug.Log($"[S2P M9] 异步直读不可用({readEx.Message}),回退映射 memcpy 路径", this);
+                    using var data = SplatAssetPrecompiler.ReadPayloadMapped(payload, asset);
+                    readMs = sw.Elapsed.TotalMilliseconds;
+                    CreateResources(data, asset.ChunkBounds);
+                    cameras = asset.Cameras ?? Array.Empty<GaussianSplatCameras.CameraInfo>();
+                    loaded = true;
+                    Debug.Log($"[S2P M9] 映射 memcpy 加载: 读盘 {readMs:F1} ms + GPU 上传 {sw.Elapsed.TotalMilliseconds - readMs:F1} ms [{LastUploadBreakdownMs}]", this);
+                }
                 sw.Stop();
+                if (!loaded) throw new InvalidOperationException("M9 快速路径未加载数据");
                 LastLoadMilliseconds = sw.Elapsed.TotalMilliseconds;
-                Debug.Log($"[S2P M9] 预编译直通加载 '{asset.name}': {m_SplatCount:N0} splats / {LastLoadMilliseconds:F1} ms(CRC 0x{asset.PayloadCrc32:X8})", this);
+                Debug.Log($"[S2P M9] 预编译直通加载 '{asset.name}': {m_SplatCount:N0} splats / {LastLoadMilliseconds:F1} ms", this);
                 return true;
             }
             catch (Exception e)

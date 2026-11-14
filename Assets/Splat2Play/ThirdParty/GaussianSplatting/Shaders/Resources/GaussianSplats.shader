@@ -105,7 +105,7 @@ struct FragOutput
 {
     half4 color : SV_Target0;
 #if SPLAT_REPROJECTED || S2P_WRITE_DEPTH
-    float depth : SV_Target1;
+    float4 depth : SV_Target1;
 #endif
 };
 
@@ -135,11 +135,13 @@ FragOutput frag (v2f i)
     FragOutput res;
     res.color = half4(i.col.rgb, alpha);
 #if SPLAT_REPROJECTED || S2P_WRITE_DEPTH
-    // M13 T13.2:输出预乘 α 的 Reversed-Z 深度。Front-to-Back Under 混合下
-    // _GaussianSplatDepthRT 累积值 D = Σ w_i·z_i(w_i = α_i·(1−A_prev)),合成端除以
-    // 累积不透明度 A = Σ w_i 即得透射率加权期望表面深度;
-    // Stochastic 模式下 alpha 恒为 1 → res.depth = i.vertex.z,与 Reprojected 原语义 100% 统一。
-    res.depth = i.vertex.z * alpha;
+    // M13 T13.2:输出预乘 α 的 Reversed-Z 深度(float4)。Front-to-Back Under 混合下
+    // _GaussianSplatDepthRT.r 累积 D = Σ w_i·z_i(w_i = α_i·(1−A_prev)),.a 以与 Target0 完全
+    // 相同的递推累积 A = Σ w_i;合成端 D/A 即透射率加权期望表面深度。
+    // 为什么必须 float4:R32 格式无 alpha 通道,D3D12 混合的 dst-α 因子恒为 1 →
+    // OneMinusDstAlpha = 0,深度永远无法累积(Reprojected 的 One/Zero 混合不受影响)。
+    // Stochastic 模式下 alpha 恒为 1 → res.depth.r = i.vertex.z,与 Reprojected 原语义 100% 统一。
+    res.depth = float4(i.vertex.z * alpha, alpha, alpha, alpha);
 #endif
     return res;
 }

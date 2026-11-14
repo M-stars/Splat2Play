@@ -71,3 +71,40 @@
 - `S2PVoxelize.compute` CSClearGrid 清零内核的循环覆盖范围错误(每线程自全局 id 扫至缓冲区末尾,
   写放大 4096 倍,512³ 达 4.3 万亿次存储 → D3D12 设备移除);修正为组内 4096 范围后
   256³ GPU 体素化+SDF 从 405ms 降至 **107ms**;密度场改用 RWByteAddressBuffer(Raw)承载 512MB
+
+## M9–M13 v3 商业化里程碑无头验证(2026-11-15,scene_bonsai 1,244,819 splats,`SplatM9To13Verify.Run`)
+
+| 里程碑 | 验证项 | 实测结果 |
+|---|---|---|
+| M9 | PLY → .s2pbin 预编译 | 1,244,819 splats / SH3 / 304 chunks,载荷 **71.2 MB**,预编译耗时 812-882 ms |
+| M9 | CRC32 校验 | 文件头 0x84A668E3 与资产元数据 **100% 一致**;全量校验通过;单字节翻转损坏拦截 ✓ |
+| M9 | 加载耗时对比 | 原始 PLY 路径 515-1594 ms(±3× 机器噪声);预编译直通稳态 **36.7-41.6 ms**(3 采样取最小),提速 **16.9-26.3×** |
+| M10 | 三机位渲染完整性 | 远景非黑 99.5% / 中景 99.3% / 室内 93.0%(无孔洞/误剔除)✓ |
+| M10 | LOD 分档分布 | 远景 L0 0 / L1 0 / L2 304;中景 1/1/302;室内 5/19/278(共 304 块,零额外显存)|
+| M10 | 光栅化缩减 | 远景可见 77,802 / 1,244,819 = **93.7% 缩减**(室内 111,082)|
+| M11 | 自动物件检测 | 96³ CCL + XZ-PCA **47-61 ms**;检出 1 个独立物件(1,584 splats,OBB 2.27×0.85×1.14 m,yaw 0.3°)|
+| M11 | 组合碰撞 | 首个物件 → **8 个非重叠 BoxCollider**(凹体保留)✓ |
+| M12 | 32³ 材质场 | 550-601 ms;实心 2,772 格 + 膨胀 2,018 格;Stone **8.9%** / Wood **2.4%** / Metal **1.1%** / Foliage **1.6%** / Default 86.1% |
+| M12 | 程序化音效 | 5 类 AudioClip 确定性合成(Default 100 / Stone 140 / Wood 120 / Metal 180 / Foliage 220 ms @ 32kHz)✓ |
+| M13 | 深度导出 | SortedBlended + m_WriteSplatDepth:_GaussianSplatDepthRT 非零有效像素 **95.7%**(目标 >50%)✓ |
+
+截图:`m10_hlod_far.png` / `m10_hlod_mid.png` / `m10_hlod_inside.png` / `m13_depth_export.png`(smoke_out)。
+
+### M9 <35ms 目标的硬件上下文(如实记录)
+
+规格参考机按 ~850ms 原始基线 + NVMe 推算出 <35ms。本机实测:71.2MB 载荷 = 磁盘读(31-48ms,
+AsyncReadManager 原生并行直读,VS FileStream 大缓冲 30ms / MMF memcpy 37-85ms±2× 噪声)+
+PCIe 上传(20-39ms,4 缓冲 alloc≈0 / copy 主导)。解码/排序/转换工作已**结构性消除**(CRC 与
+点数/分块校验全通过),稳态 36.7-41.6ms、提速 16.9-26.3×;在参考机 IO/上传带宽下可达 <35ms。
+
+### 验证期间发现并修复的问题
+
+- **M13 深度目标格式(R32 → RGBA32F)**:R32_SFloat 无 alpha 通道,D3D12 混合的 dst-α 因子恒为 1
+  → `OneMinusDstAlpha` = 0,预乘深度永不累积(非零像素 0%)。修复:深度目标改 **RGBA32F**,
+  SV_Target1 输出 float4(z·α, α, α, α)——α 通道以与颜色目标完全相同的递推累积 A,
+  r 精确累积 D = Σ w_i·z_i;Reprojected 路径保持 R32 标量写入不变(One/Zero 混合不受 dst-α 影响)
+- **M11 检测器中心 Y**:旋转系 OBB 中心回变换后漏加网格原点 lo.y(单元测试场景 lo.y=0 掩盖了 bug);
+  真实扫描上物件整体错位 → Extract 命中 0 splat;已修复并经真实资产验证(检出盆景盆 1,584 splats)
+- **M9 加载路径选型**:FileStream 大缓冲 ≈30ms / AsyncReadManager ≈31-48ms / MMF memcpy 37-85ms
+  (±2× 缺页噪声);选定 AsyncReadManager 为主、映射 memcpy 为回退;CRC32 从热路径剥离
+  (Burst CRC ≈ 71MB 25ms,保留给预编译写出与测试/验证路径)

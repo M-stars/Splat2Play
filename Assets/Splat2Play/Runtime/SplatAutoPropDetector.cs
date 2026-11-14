@@ -320,11 +320,11 @@ namespace Splat2Play.Runtime
                 double yaw = useA ? theta : -theta;
 
                 // OBB 中心:第二遍扫描旋转的是网格局部坐标(米,原点 = lo),中点经 R_ccw(−yaw)
-                // 回变换后须加回网格原点 lo 才是世界坐标
+                // 回变换后须加回网格原点 lo 才是世界坐标(Y 同样是网格局部坐标,须加 lo.y)
                 double2 rMid = (rMin + rMax) * 0.5;
                 float3 center = new float3(
                     lo.x + (float)(cs.x * rMid.x + cs.y * rMid.y),
-                    (float)(a.SumYm * invN),
+                    lo.y + (float)(a.SumYm * invN),
                     lo.z + (float)(-cs.y * rMid.x + cs.x * rMid.y));
                 float3 halfExtents = new float3(
                     (float)((rMax.x - rMin.x) * 0.5 + cellSize.x * 0.5),
