@@ -419,6 +419,11 @@ namespace Splat2Play.Editor
                         if (_replaceBackground && _targetRenderer != null)
                         {
                             Undo.RecordObject(_targetRenderer, "Splat2Play Replace Background");
+                            if (_targetRenderer.m_PrecompiledAsset != null)
+                            {
+                                _targetRenderer.m_PrecompiledAsset = null;
+                                log.AppendLine("[M8/M9] 已解绑未剥离的旧预编译资产(如需直通加载请对修补后背景重新执行预编译)");
+                            }
                             _targetRenderer.m_SourcePath = bgPath;
                             _targetRenderer.Reload(); // 重载修补后的背景
                             log.AppendLine("[M8] 主背景已切换为修补后 PLY 并重载");
@@ -466,6 +471,7 @@ namespace Splat2Play.Editor
                     sw.Stop();
 
                     Undo.RecordObject(_settings, "Splat2Play Auto Detect Props");
+                    _settings.DynamicProps.RemoveAll(p => p.PropName != null && p.PropName.StartsWith("AutoProp", System.StringComparison.Ordinal));
                     int startIndex = _settings.DynamicProps.Count;
                     foreach (var vol in volumes)
                         _settings.DynamicProps.Add(vol);

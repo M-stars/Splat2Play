@@ -123,9 +123,10 @@ namespace Splat2Play.Runtime
             }
 
             string streaming = "关闭";
+            bool hasExactGpuCount = SplatRenderer != null && SplatRenderer.GpuCullingActive && SplatRenderer.GpuCullingVisibleSplats >= 0;
             if (TryGetComponent<S2PSplatStreaming>(out var st) && st.enabled)
             {
-                if (activeCount > 0 && st.TotalChunkCount > 1)
+                if (!hasExactGpuCount && activeCount > 0 && st.TotalChunkCount > 1)
                     _visibleSplats = st.VisibleSplatEstimate;
                 string cullDetail = st.IsOccluded ? " [代理遮挡]" : (!st.IsFrustumVisible ? " [视锥外]" : "");
                 string chunkStr = st.TotalChunkCount > 1 ? $" 块:{st.VisibleChunkCount}/{st.TotalChunkCount}" : "";

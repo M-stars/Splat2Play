@@ -19,7 +19,7 @@ namespace Splat2Play.Runtime
         [Tooltip("目标帧预算(毫秒);与 GaussianSplatRenderingOptions.m_TargetFrameBudgetMs 同步使用")]
         public float TargetFrameBudgetMs = 8f;
 
-        [Tooltip("乘数下限(<1 表示比用户设定更早进入 LOD,用于低功耗设备兜底)")]
+        [Tooltip("乘数下限(<1 表示帧率充裕时放宽切换距离,更晚进入 LOD)")]
         public float MinMultiplier = 0.6f;
 
         [Tooltip("乘数上限(过高会整体糊化;默认 3.5)")]
@@ -70,16 +70,34 @@ namespace Splat2Play.Runtime
             }
 
             // 比例偏差 → 乘数积分:超预算 100% 时每秒 +Responsiveness;余量充足时以一半速度回落
-            float ratio = _smoothFrameMs / TargetFrameBudgetMs;
-            float step = (ratio - 1f) * Responsiveness * Time.unscaledDeltaTime * (ratio > 1f ? 1f : 0.5f);
-            LodDistanceMultiplier = Mathf.Clamp(LodDistanceMultiplier + step, MinMultiplier, MaxMultiplier);
-            Apply(LodDistanceMultiplier);
+            var (nextMul, lod1, lod2) = StepBudget(
+                LodDistanceMultiplier, _smoothFrameMs, TargetFrameBudgetMs,
+                Time.unscaledDeltaTime, Responsiveness, MinMultiplier, MaxMultiplier,
+                _baseLod1, _baseLod2);
+            LodDistanceMultiplier = nextMul;
+            _options.m_Lod1Distance = lod1;
+            _options.m_Lod2Distance = lod2;
+        }
+
+        /// <summary>M10 纯函数步进:帧耗时超预算(smoothFrameMs &gt; targetBudgetMs)时乘数上升、LOD 切换距离缩短(负反馈)。</summary>
+        public static (float nextMultiplier, float lod1Distance, float lod2Distance) StepBudget(
+            float currentMultiplier, float smoothFrameMs, float targetBudgetMs,
+            float dt, float responsiveness, float minMul, float maxMul,
+            float baseLod1, float baseLod2)
+        {
+            float ratio = smoothFrameMs / Mathf.Max(targetBudgetMs, 0.01f);
+            float step = (ratio - 1f) * responsiveness * dt * (ratio > 1f ? 1f : 0.5f);
+            float next = Mathf.Clamp(currentMultiplier + step, minMul, maxMul);
+            float inv = 1f / Mathf.Max(next, 0.01f);
+            return (next, baseLod1 * inv, baseLod2 * inv);
         }
 
         void Apply(float m)
         {
-            _options.m_Lod1Distance = _baseLod1 * m;
-            _options.m_Lod2Distance = _baseLod2 * m;
+            // m > 1(超预算)时缩短切换距离以提前进入 LOD1/LOD2;m < 1(帧率充裕)时放宽切换距离
+            float inv = 1f / Mathf.Max(m, 0.01f);
+            _options.m_Lod1Distance = _baseLod1 * inv;
+            _options.m_Lod2Distance = _baseLod2 * inv;
         }
     }
 }

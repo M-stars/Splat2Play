@@ -1496,5 +1496,27 @@ namespace Splat2Play.Tests
                 Assert.AreEqual(0.7f, zEff, 1e-6, "稀疏覆盖下 zEff 仍应等于该层深度(供调试对照)");
             }
         }
+
+        [Test]
+        public void M10_LodBudgetController_NegativeFeedbackDirection()
+        {
+            // 帧耗时高于预算(16ms > 8ms)时:乘数上升(>1),LOD1/LOD2 切换距离必须缩短(提前降级以减轻 GPU 负载)
+            var (mulOver, lod1Over, lod2Over) = S2PLodBudgetController.StepBudget(
+                currentMultiplier: 1f, smoothFrameMs: 16f, targetBudgetMs: 8f,
+                dt: 0.5f, responsiveness: 1.2f, minMul: 0.6f, maxMul: 3.5f,
+                baseLod1: 12f, baseLod2: 28f);
+            Assert.That(mulOver, Is.GreaterThan(1f), "超预算时乘数应大于 1");
+            Assert.That(lod1Over, Is.LessThan(12f), "超预算时 LOD1 切换距离必须缩短(负反馈)");
+            Assert.That(lod2Over, Is.LessThan(28f), "超预算时 LOD2 切换距离必须缩短(负反馈)");
+
+            // 帧耗时低于预算(4ms < 8ms)时:乘数回落(<1),LOD1/LOD2 切换距离放宽
+            var (mulUnder, lod1Under, lod2Under) = S2PLodBudgetController.StepBudget(
+                currentMultiplier: 1f, smoothFrameMs: 4f, targetBudgetMs: 8f,
+                dt: 0.5f, responsiveness: 1.2f, minMul: 0.6f, maxMul: 3.5f,
+                baseLod1: 12f, baseLod2: 28f);
+            Assert.That(mulUnder, Is.LessThan(1f), "帧率充裕时乘数应小于 1");
+            Assert.That(lod1Under, Is.GreaterThan(12f), "帧率充裕时 LOD1 切换距离应放宽");
+            Assert.That(lod2Under, Is.GreaterThan(28f), "帧率充裕时 LOD2 切换距离应放宽");
+        }
     }
 }

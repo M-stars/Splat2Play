@@ -768,6 +768,7 @@ namespace GaussianSplatting.Runtime
         GraphicsBuffer m_GpuSHData;
         GraphicsBuffer m_GpuColorData;
         string m_PrevSourcePath;
+        GaussianSplatPrecompiledAsset m_PrevPrecompiledAsset;
         GaussianSplatLoadOperation m_LoadOperation;
         int m_SHCoefficients;
         bool m_Registered;
@@ -1010,6 +1011,7 @@ namespace GaussianSplatting.Runtime
         {
             FinishLoading();
             m_PrevSourcePath = m_SourcePath;
+            m_PrevPrecompiledAsset = m_PrecompiledAsset;
             DisposeResources();
             loadError = null;
             cameras = Array.Empty<GaussianSplatCameras.CameraInfo>();
@@ -1208,7 +1210,7 @@ namespace GaussianSplatting.Runtime
 
         public void Update()
         {
-            if (m_PrevSourcePath != m_SourcePath) Reload();
+            if (m_PrevSourcePath != m_SourcePath || m_PrevPrecompiledAsset != m_PrecompiledAsset) Reload();
 #if UNITY_EDITOR
             if (!Application.isPlaying) return;
 #endif
