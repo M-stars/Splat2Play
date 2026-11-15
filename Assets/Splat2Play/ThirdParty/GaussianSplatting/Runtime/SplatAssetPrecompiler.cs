@@ -21,30 +21,29 @@ using Debug = UnityEngine.Debug;
 
 namespace GaussianSplatting.Runtime
 {
-        /// <summary>IEEE 802.3 CRC32(反射多项式 0xEDB88320,初值/终值 0xFFFFFFFF)。</summary>
-        public static class S2PCrc32
+        /// <summary>IEEE 802.3 CRC32(反射多项式 0xEDB88320,初值/终值 0xFFFFFFFF)。
+        /// 表由调用方以指针形式提供(Burst 不支持访问托管静态数组 BC1044,见 S2PCrc32Job)。</summary>
+        public static unsafe class S2PCrc32
         {
             public const uint kInitial = 0xFFFFFFFFu;
+            public const int kTableSize = 256;
 
-            static readonly uint[] s_Table = BuildTable();
-
-            static uint[] BuildTable()
+            /// <summary>把反射表构建到调用方缓冲区(stackalloc / NativeArray 均可;256×8 次迭代 ≈ 0 成本)。</summary>
+            public static void BuildTable(uint* table)
             {
-                var table = new uint[256];
-                for (uint i = 0; i < 256; ++i)
+                for (uint i = 0; i < kTableSize; ++i)
                 {
                     uint c = i;
                     for (int k = 0; k < 8; ++k)
                         c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
                     table[i] = c;
                 }
-                return table;
             }
 
-            public static unsafe uint Update(uint crc, byte* data, long length)
+            public static uint Update(uint crc, uint* table, byte* data, long length)
             {
                 for (long i = 0; i < length; ++i)
-                    crc = s_Table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+                    crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
                 return crc;
             }
 
@@ -54,6 +53,7 @@ namespace GaussianSplatting.Runtime
         /// <summary>
         /// 四路载荷 CRC 的 Burst 作业(71MB 场景 Mono 下 ~200ms → Burst ~25ms;
         /// 供离线预编译与校验路径使用;运行时热路径按规格仅校验魔数/点数,不做全量 CRC)。
+        /// 注意:Burst 不支持托管静态数组(BC1044)——反射表在作业内 stackalloc 重建(1KB 栈,≈0 成本)。
         /// </summary>
         [BurstCompile(FloatMode = FloatMode.Fast)]
         struct S2PCrc32Job : IJob
@@ -66,18 +66,22 @@ namespace GaussianSplatting.Runtime
 
             public unsafe void Execute()
             {
+                uint* table = stackalloc uint[S2PCrc32.kTableSize];
+                S2PCrc32.BuildTable(table);
                 uint crc = S2PCrc32.kInitial;
-                crc = Update(crc, Positions);
-                crc = Update(crc, Geometry);
-                crc = Update(crc, Colors);
-                crc = Update(crc, Sh);
+                crc = Update(crc, table, Positions);
+                crc = Update(crc, table, Geometry);
+                crc = Update(crc, table, Colors);
+                crc = Update(crc, table, Sh);
                 Result[0] = S2PCrc32.Finalize(crc);
             }
 
-            static unsafe uint Update(uint crc, NativeArray<uint> arr)
+            static unsafe uint Update(uint crc, uint* table, NativeArray<uint> arr)
             {
-                var bytes = arr.Reinterpret<byte>(sizeof(uint));
-                return S2PCrc32.Update(crc, (byte*)bytes.GetUnsafeReadOnlyPtr(), bytes.Length);
+                // 直接以字节视角遍历(不经过 Reinterpret,Burst 兼容更稳)
+                byte* p = (byte*)arr.GetUnsafeReadOnlyPtr();
+                long len = (long)arr.Length * 4;
+                return S2PCrc32.Update(crc, table, p, len);
             }
         }
 

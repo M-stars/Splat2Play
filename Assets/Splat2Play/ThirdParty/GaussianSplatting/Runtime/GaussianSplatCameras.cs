@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
@@ -7,6 +8,7 @@ namespace GaussianSplatting.Runtime
 {
     public static class GaussianSplatCameras
     {
+        [Serializable]
         public struct CameraInfo
         {
             public Vector3 position;
