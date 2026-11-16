@@ -131,7 +131,7 @@ void CSVoxelizeSplats(uint3 id : SV_DispatchThreadID)
         if (d2 > kMaxD2)
             continue;
         float w = op * exp(-d2 * 0.5);
-        int add = (int)(w * 65536.0 + 0.5);
+        int add = (int)(w * 65536.0); // 与 CPU VoxelizeJob (int)(w * 65536f) 统一截断取整
         if (add <= 0)
             continue;
         _DensityQ16.InterlockedAdd((uint)((x + y * n + z * n2) * 4), add);

@@ -49,7 +49,7 @@
 
 - 256³ 体素化+SDF 端到端 **139 ms(< 150ms 目标 ✓)**;纯 GPU 派发 36 ms
 - 512³ 纯 GPU 派发 67 ms;端到端 758 ms 由 512MB 密度场 PCIe 读回主导(CPU 共享的 Fill/SurfaceNets 阶段不变)
-- GPU 后端三角面与 CPU 略有差异(76,053 vs 76,143):GPU 路径 SDF 在填充前执行(§2.2 规格 GPU 流程),结构一致性由单元测试(UseSDF=false 下掩码/网格完全一致)保证
+- GPU 后端三角面与 CPU 存在极微小差异(76,053 vs 76,143,约 0.1%):两后端管线阶段顺序(体素化→填充→SDF)与 Q16 截断取整完全一致,微小面数差源于 GPU HLSL `exp` 与 CPU Burst `math.exp` 的 ~1 ULP 超越函数硬件精度差在多 splat 重叠体素处的累积;结构等价性由单元测试(`GpuVoxelize_MatchesCpuVoxelize_Within1Lsb`)保证
 
 ## M6/M7/M8 无头运行时验证(2026-11-12,scene_bonsai 1,244,819 splats,`SplatM678Verify.Run`)
 

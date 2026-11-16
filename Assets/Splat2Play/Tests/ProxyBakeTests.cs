@@ -1518,5 +1518,31 @@ namespace Splat2Play.Tests
             Assert.That(lod1Under, Is.GreaterThan(12f), "帧率充裕时 LOD1 切换距离应放宽");
             Assert.That(lod2Under, Is.GreaterThan(28f), "帧率充裕时 LOD2 切换距离应放宽");
         }
+
+        [Test]
+        public void M3_LightProxyRegistry_UnregistersAndPrunesDestroyedMeshes()
+        {
+            S2PLightProxyRegistry.Clear();
+            var m1 = new Mesh { name = "TempShadow1" };
+            var m2 = new Mesh { name = "TempShadow2" };
+            try
+            {
+                S2PLightProxyRegistry.RegisterShadowMesh(m1);
+                S2PLightProxyRegistry.RegisterShadowMesh(m2);
+                Assert.AreEqual(2, S2PLightProxyRegistry.ShadowMeshes.Count);
+
+                // 销毁 m1 后再次注册/注销应自动清理已销毁的伪 null 引用
+                UnityEngine.Object.DestroyImmediate(m1);
+                m1 = null;
+                S2PLightProxyRegistry.UnregisterShadowMesh(m2);
+                Assert.AreEqual(0, S2PLightProxyRegistry.ShadowMeshes.Count, "注销与销毁清理后注册表应为空");
+            }
+            finally
+            {
+                if (m1 != null) UnityEngine.Object.DestroyImmediate(m1);
+                if (m2 != null) UnityEngine.Object.DestroyImmediate(m2);
+                S2PLightProxyRegistry.Clear();
+            }
+        }
     }
 }

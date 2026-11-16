@@ -687,6 +687,8 @@ namespace GaussianSplatting.Runtime
 
             // Prepare per-object ranges, then globally sort and draw.
             Material matComposite = SortAndRenderSplats(cam, m_CommandBuffer);
+            matComposite.SetFloat("_ZWrite", 0f);
+            matComposite.DisableKeyword("S2P_WRITE_COMPOSITE_DEPTH");
 
             // compose
             m_CommandBuffer.BeginSample(s_ProfCompose);

@@ -12,6 +12,8 @@ namespace Splat2Play.Runtime
     /// <summary>
     /// 挂在 SplatLevel 上:按与相机的距离及代理遮挡状态切换 Full/Reduced/Unloaded/Culled。
     /// Unloaded/Culled 时禁用 GaussianSplatRenderer(释放 GPU 缓冲,OnEnable 时自动重载)。
+    /// 重要建议(M9):启用流送卸载/恢复的商业关卡请务必为 Target 绑定 GaussianSplatPrecompiledAsset(.s2pbin),
+    /// 可将 Unloaded→Full/Reduced 的重载耗时从原始 PLY 的 0.5–1.6s 降至 ~36–42ms,消除转头重载卡顿。
     /// </summary>
     [DisallowMultipleComponent]
     public sealed class S2PSplatStreaming : MonoBehaviour
@@ -43,6 +45,7 @@ namespace Splat2Play.Runtime
         public int VisibleSplatEstimate { get; private set; }
 
         float _pendingUnloadSince = -1f;
+        bool _warnedNoPrecompiled;
         readonly Plane[] _frustumPlanes = new Plane[6];
 
         void Update()
@@ -144,8 +147,15 @@ namespace Splat2Play.Runtime
         Bounds TransformBounds(Bounds localB)
         {
             Vector3 worldCenter = transform.TransformPoint(localB.center);
-            Vector3 worldSize = Vector3.Scale(localB.size, transform.lossyScale);
-            return new Bounds(worldCenter, new Vector3(Mathf.Abs(worldSize.x), Mathf.Abs(worldSize.y), Mathf.Abs(worldSize.z)));
+            Vector3 ext = localB.extents;
+            Vector3 axisX = transform.TransformVector(ext.x, 0f, 0f);
+            Vector3 axisY = transform.TransformVector(0f, ext.y, 0f);
+            Vector3 axisZ = transform.TransformVector(0f, 0f, ext.z);
+            Vector3 worldExt = new Vector3(
+                Mathf.Abs(axisX.x) + Mathf.Abs(axisY.x) + Mathf.Abs(axisZ.x),
+                Mathf.Abs(axisX.y) + Mathf.Abs(axisY.y) + Mathf.Abs(axisZ.y),
+                Mathf.Abs(axisX.z) + Mathf.Abs(axisY.z) + Mathf.Abs(axisZ.z));
+            return new Bounds(worldCenter, worldExt * 2f);
         }
 
         /// <summary>
@@ -185,11 +195,19 @@ namespace Splat2Play.Runtime
             switch (state)
             {
                 case SplatStreamState.Full:
-                    if (!Target.isActiveAndEnabled) Target.enabled = true;
+                    if (!Target.isActiveAndEnabled)
+                    {
+                        WarnIfMissingPrecompiled();
+                        Target.enabled = true;
+                    }
                     Target.m_SHOrder = maxSh;
                     break;
                 case SplatStreamState.Reduced:
-                    if (!Target.isActiveAndEnabled) Target.enabled = true;
+                    if (!Target.isActiveAndEnabled)
+                    {
+                        WarnIfMissingPrecompiled();
+                        Target.enabled = true;
+                    }
                     Target.m_SHOrder = Mathf.Min(FarSHOrder, maxSh);
                     break;
                 case SplatStreamState.Unloaded:
@@ -197,6 +215,14 @@ namespace Splat2Play.Runtime
                     Target.enabled = false; // OnDisable 释放 GPU 缓冲;重新启用时自动 Reload
                     break;
             }
+        }
+
+        void WarnIfMissingPrecompiled()
+        {
+            if (_warnedNoPrecompiled || Target == null || Target.m_PrecompiledAsset != null) return;
+            _warnedNoPrecompiled = true;
+            Debug.LogWarning("[Splat2Play][M4/M9] 流送从 Unloaded/Culled 恢复时未绑定 m_PrecompiledAsset(.s2pbin)," +
+                             "将回退原始 PLY/SPZ 流式解码(0.5–1.6s);建议在烘焙向导中生成并绑定 M9 预编译资产(<40ms)。", this);
         }
     }
 }

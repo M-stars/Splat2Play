@@ -12,6 +12,8 @@ namespace Splat2Play.Runtime
         public Transform Target;
         public float CatchDistance = 1.5f;
         public float RepathInterval = 0.25f;
+        [Tooltip("抓捕视线遮挡检测层(防止隔薄墙穿墙抓捕)")]
+        public LayerMask ObstacleMask = ~0;
 
         NavMeshAgent _agent;
         Vector3 _spawnPosition;
@@ -40,13 +42,27 @@ namespace Splat2Play.Runtime
             }
 
             float dist = Vector3.Distance(transform.position, Target.position);
-            if (dist < CatchDistance)
+            if (dist < CatchDistance && HasLineOfSight())
             {
                 ++_catchCount;
                 Debug.Log($"[Splat2Play] 敌人抓住玩家(第 {_catchCount} 次),位置 {transform.position:F1}");
                 // 重置回初始出生点,便于演示连续性
                 _agent.Warp(_spawnPosition);
             }
+        }
+
+        /// <summary>视线检查:排除自身与目标碰撞体后,若中间被墙体/代理网格阻挡则不判定为抓捕。</summary>
+        bool HasLineOfSight()
+        {
+            Vector3 from = transform.position + Vector3.up * 0.8f;
+            Vector3 to = Target.position + Vector3.up * 0.8f;
+            if (Physics.Linecast(from, to, out RaycastHit hit, ObstacleMask, QueryTriggerInteraction.Ignore))
+            {
+                if (hit.transform == transform || hit.transform.IsChildOf(transform)) return true;
+                if (hit.transform == Target || hit.transform.IsChildOf(Target)) return true;
+                return false;
+            }
+            return true;
         }
     }
 }

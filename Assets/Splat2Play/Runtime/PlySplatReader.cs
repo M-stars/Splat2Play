@@ -202,7 +202,8 @@ namespace Splat2Play.Runtime
 
         /// <summary>快速路径:只提取位置(边界估算等场景)。返回数组由调用方 Dispose。</summary>
         public static NativeArray<float3> ReadPositions(Stream stream, in PlyHeader header)
-        {            NativeArray<byte> bytes = default;
+        {
+            NativeArray<byte> bytes = default;
             NativeArray<float3> result = default;
             bool ok = false;
             try
@@ -311,7 +312,8 @@ namespace Splat2Play.Runtime
 
         [BurstCompile(FloatMode = FloatMode.Fast)]
         struct UnpackPositionsJob : IJobParallelFor
-        {            [ReadOnly] public NativeArray<byte> Bytes;
+        {
+            [ReadOnly] public NativeArray<byte> Bytes;
             public int Stride;
             public int OffX, OffY, OffZ;
             [NativeDisableParallelForRestriction] public NativeArray<float3> Out;

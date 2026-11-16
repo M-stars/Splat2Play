@@ -185,13 +185,16 @@ namespace GaussianSplatting.Runtime
                         GaussianSplatRenderingOptions.instance.m_SplatDepthAlphaThreshold);
                     if (compositeDepthWrite)
                     {
-                        // 写回模式:相机深度绑定为 DSV 接收 SV_Depth;否则保持原行为(仅颜色目标)
+                        // 写回模式:启用 S2P_WRITE_COMPOSITE_DEPTH 变体并绑定相机深度为 DSV 接收 SV_Depth;
+                        // 关闭时禁用该 keyword,不在片元签名中声明 SV_Depth 以保留 Early-Z
                         matComposite.SetFloat("_ZWrite", 1f);
+                        matComposite.EnableKeyword("S2P_WRITE_COMPOSITE_DEPTH");
                         CoreUtils.SetRenderTarget(commandBuffer, cameraColor, cameraDepth);
                     }
                     else
                     {
                         matComposite.SetFloat("_ZWrite", 0f);
+                        matComposite.DisableKeyword("S2P_WRITE_COMPOSITE_DEPTH");
                         CoreUtils.SetRenderTarget(commandBuffer, cameraColor);
                     }
                     commandBuffer.SetViewport(new Rect(0, 0, data.Width, data.Height));

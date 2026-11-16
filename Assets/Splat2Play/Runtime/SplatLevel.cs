@@ -34,6 +34,28 @@ namespace Splat2Play.Runtime
         public bool UseCoarseNavMeshProxy = true;
 
         const string kCollisionChild = "S2P_Collision";
+        Mesh _registeredShadowMesh;
+
+        void OnEnable()
+        {
+            if (Proxy != null && Proxy.CollisionMesh != null)
+            {
+                _registeredShadowMesh = Proxy.CollisionMesh;
+                S2PLightProxyRegistry.RegisterShadowMesh(_registeredShadowMesh);
+            }
+        }
+
+        void OnDisable() => UnregisterCurrentShadowMesh();
+        void OnDestroy() => UnregisterCurrentShadowMesh();
+
+        void UnregisterCurrentShadowMesh()
+        {
+            if (_registeredShadowMesh != null)
+            {
+                S2PLightProxyRegistry.UnregisterShadowMesh(_registeredShadowMesh);
+                _registeredShadowMesh = null;
+            }
+        }
 
         /// <summary>在烘焙 NavMesh 前后切换碰撞体网格为 NavigationMesh / CollisionMesh。</summary>
         public void SwapToNavigationMesh(bool useNavMesh)
@@ -82,25 +104,35 @@ namespace Splat2Play.Runtime
 
             if (ShowCollisionDebug || CastApproximateShadows)
             {
-                var mf = collisionGo.AddComponent<MeshFilter>();
-                mf.sharedMesh = Proxy.CollisionMesh;
-                var mr = collisionGo.AddComponent<MeshRenderer>();
                 var shader = Shader.Find("Universal Render Pipeline/Lit")
                              ?? Shader.Find("Universal Render Pipeline/Simple Lit")
                              ?? Shader.Find("Universal Render Pipeline/Unlit");
-                var mat = new Material(shader)
+                if (shader != null)
                 {
-                    name = "S2P_CollisionDebug",
-                    hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild
-                };
-                mat.SetColor("_BaseColor", new Color(0f, 1f, 0.4f, 0.35f));
-                mr.sharedMaterial = mat;
-                mr.shadowCastingMode = ShowCollisionDebug
-                    ? (CastApproximateShadows ? ShadowCastingMode.On : ShadowCastingMode.Off)
-                    : ShadowCastingMode.ShadowsOnly;
+                    var mf = collisionGo.AddComponent<MeshFilter>();
+                    mf.sharedMesh = Proxy.CollisionMesh;
+                    var mr = collisionGo.AddComponent<MeshRenderer>();
+                    var mat = new Material(shader)
+                    {
+                        name = "S2P_CollisionDebug",
+                        hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild
+                    };
+                    mat.SetColor("_BaseColor", new Color(0f, 1f, 0.4f, 0.35f));
+                    mr.sharedMaterial = mat;
+                    mr.shadowCastingMode = ShowCollisionDebug
+                        ? (CastApproximateShadows ? ShadowCastingMode.On : ShadowCastingMode.Off)
+                        : ShadowCastingMode.ShadowsOnly;
+                }
+                else
+                {
+                    Debug.LogWarning("[Splat2Play] 未找到 URP 内置着色器(Lit/Simple Lit/Unlit),已跳过代理阴影/调试材质挂载", this);
+                }
             }
 
-            S2PLightProxyRegistry.RegisterShadowMesh(Proxy.CollisionMesh);
+            if (_registeredShadowMesh != null && _registeredShadowMesh != Proxy.CollisionMesh)
+                S2PLightProxyRegistry.UnregisterShadowMesh(_registeredShadowMesh);
+            _registeredShadowMesh = Proxy.CollisionMesh;
+            S2PLightProxyRegistry.RegisterShadowMesh(_registeredShadowMesh);
 
             // M12 T12.3:烘焙产物含 32³ 空间材质场时自动挂载运行时材质查询组件
             if (Proxy.SurfaceGrid != null && Proxy.SurfaceGrid.Count > 0)

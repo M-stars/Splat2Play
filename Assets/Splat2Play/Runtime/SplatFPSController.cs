@@ -150,8 +150,10 @@ namespace Splat2Play.Runtime
             float pitch = props.FootstepPitch * (0.92f + 0.16f * ((jitter >> 24) & 15u) / 15f);
             var clip = S2PProceduralAudio.GetClip(surf);
             if (clip != null && _audioSrc != null)
+            {
+                _audioSrc.pitch = pitch;
                 _audioSrc.PlayOneShot(clip, FootstepVolume);
-            if (_audioSrc != null) _audioSrc.pitch = pitch;
+            }
         }
 
         /// <summary>M12:脚下表面材质查询(向下 1.6m 射线 + 材质场 O(1) 查询;未命中回退玩家位置)。</summary>

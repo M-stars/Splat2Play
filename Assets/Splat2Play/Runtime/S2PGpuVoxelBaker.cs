@@ -50,8 +50,9 @@ namespace Splat2Play.Runtime
         /// <summary>
         /// GPU 体素化(+可选 SDF 平滑)并同步读回密度场,输出写入 densityQ16Out。
         /// GPU 不可用时抛 InvalidOperationException(调用方负责回退 CPU)。
-        /// 注意:GPU 路径的 SDF 在填充前执行(§2.2 规格流程图:体素化→SDF→读回→填充),
-        /// 与 CPU 路径(体素化→填充→SDF)的阶段顺序不同,属规格既定行为。
+        /// 注:SplatProxyBaker.Bake 对 GPU/CPU 后端统一传 sdfSmooth=false,在读回并完成 FillJob 后
+        /// 再统一执行 SdfSmoothJob,确保两后端的管线阶段顺序(体素化→填充→SDF)与截断取整方式严格一致;
+        /// 仅剩硬件超越函数 exp(-d²/2) 的 ~1 ULP 浮点实现差异。
         /// </summary>
         public static void Voxelize(NativeArray<SplatRaw> splats, NativeArray<AabbRange> exclusions,
                                     in VoxelGridInfo grid, float opacityWeight,

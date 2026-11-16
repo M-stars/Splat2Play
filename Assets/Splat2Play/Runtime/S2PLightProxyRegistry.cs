@@ -20,19 +20,29 @@ namespace Splat2Play.Runtime
 
         public static void RegisterShadowMesh(Mesh mesh)
         {
+            s_ShadowMeshes.RemoveAll(m => m == null);
             if (mesh != null && !s_ShadowMeshes.Contains(mesh))
                 s_ShadowMeshes.Add(mesh);
         }
 
-        public static void UnregisterShadowMesh(Mesh mesh) => s_ShadowMeshes.Remove(mesh);
+        public static void UnregisterShadowMesh(Mesh mesh)
+        {
+            s_ShadowMeshes.Remove(mesh);
+            s_ShadowMeshes.RemoveAll(m => m == null);
+        }
 
         public static void RegisterSpotLight(Light light)
         {
+            s_SpotLights.RemoveAll(l => l == null);
             if (light != null && light.type == LightType.Spot && !s_SpotLights.Contains(light))
                 s_SpotLights.Add(light);
         }
 
-        public static void UnregisterSpotLight(Light light) => s_SpotLights.Remove(light);
+        public static void UnregisterSpotLight(Light light)
+        {
+            s_SpotLights.Remove(light);
+            s_SpotLights.RemoveAll(l => l == null);
+        }
 
         public static void Clear()
         {

@@ -92,7 +92,9 @@ float3 ReconstructS2PWorld(float2 pixelXY, float depth, float2 size, float proje
 struct CompositeFragOut
 {
     half4 color : SV_Target;
+#if defined(S2P_WRITE_COMPOSITE_DEPTH)
     float depth : SV_Depth;
+#endif
 };
 
 CompositeFragOut frag (v2f i)
@@ -203,6 +205,7 @@ CompositeFragOut frag (v2f i)
     // 其余像素回退场景深度,避免擦除稀疏覆盖处的既有几何深度。
     CompositeFragOut o;
     o.color = float4(col.rgb, col.a);
+#if defined(S2P_WRITE_COMPOSITE_DEPTH)
     int2 pxiOut = int2(i.vertex.xy);
     float accumA = col.a;
     float dSplat = _S2PHasSplatDepth != 0 ? _GaussianSplatDepthRT.Load(int3(pxiOut, 0)).r : 0.0;
@@ -212,7 +215,8 @@ CompositeFragOut frag (v2f i)
     if (_S2PWriteCompositeDepth != 0)
         o.depth = (accumA >= _S2PDepthAlphaThreshold && dSplat > 1e-6) ? max(dSplat, sceneDepth) : sceneDepth;
     else
-        o.depth = 1.0; // ZWrite Off 时被忽略
+        o.depth = 1.0;
+#endif
     return o;
 }
 ENDCG
@@ -230,6 +234,7 @@ ENDCG
 CGPROGRAM
 #pragma vertex vert
 #pragma fragment frag
+#pragma multi_compile_local __ S2P_WRITE_COMPOSITE_DEPTH
 ENDCG
         }
 
