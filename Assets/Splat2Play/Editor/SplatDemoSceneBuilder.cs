@@ -26,11 +26,14 @@ namespace Splat2Play.Editor
                 Debug.LogError("[Splat2Play] 未找到 GaussianSplatURPFeature 类型(URP 宏未生效?)");
                 return;
             }
-            string[] guids = AssetDatabase.FindAssets("t:UniversalRendererData");
+            // 仅扫描工程 Assets/ 下的可写 Renderer 资产,避免误改 Packages/com.unity.render-pipelines.universal 等只读内置包资产
+            string[] guids = AssetDatabase.FindAssets("t:UniversalRendererData", new[] { "Assets" });
             int wired = 0;
             foreach (string guid in guids)
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(path) || !path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
+                    continue;
                 var rendererData = AssetDatabase.LoadAssetAtPath<UniversalRendererData>(path);
                 if (rendererData == null) continue;
 
