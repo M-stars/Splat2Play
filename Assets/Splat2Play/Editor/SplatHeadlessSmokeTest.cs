@@ -201,7 +201,7 @@ namespace Splat2Play.Editor
                 if (proxy != null)
                 {
                     string assetDir = "Assets/Splat2Play/Baked";
-                    if (!AssetDatabase.IsValidFolder(assetDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                    SplatProxyBakeWindow.EnsureAssetFolder(assetDir);
                     string assetPath = $"{assetDir}/smoke_Proxy.asset";
                     var existing = AssetDatabase.LoadAssetAtPath<ProxyData>(assetPath);
                     if (existing != null) AssetDatabase.DeleteAsset(assetPath);

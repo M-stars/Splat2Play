@@ -285,7 +285,7 @@ namespace Splat2Play.Editor
                         (stage, t) => reporter.Report(stage, t));
 
                 string bakedDir = "Assets/Splat2Play/Baked";
-                if (!AssetDatabase.IsValidFolder(bakedDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                EnsureAssetFolder(bakedDir);
                 string assetPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedDir}/{baseName}_SplatAsset.asset");
                 AssetDatabase.CreateAsset(asset, assetPath);
                 AssetDatabase.SaveAssets();
@@ -399,7 +399,7 @@ namespace Splat2Play.Editor
                                 mesh.name = $"S2P_Prop_{extraction.PropNames[v]}_Collision";
 
                                 string bakedDir = "Assets/Splat2Play/Baked";
-                                if (!AssetDatabase.IsValidFolder(bakedDir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                                EnsureAssetFolder(bakedDir);
                                 string meshAssetPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedDir}/{baseName}_{extraction.PropNames[v]}_Collider.asset");
                                 AssetDatabase.CreateAsset(mesh, meshAssetPath);
 
@@ -513,7 +513,7 @@ namespace Splat2Play.Editor
                 using var result = SplatProxyBaker.Bake(_plyPath, _settings, progress.Report);
 
                 string dir = "Assets/Splat2Play/Baked";
-                if (!AssetDatabase.IsValidFolder(dir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Baked");
+                EnsureAssetFolder(dir);
                 string baseName = Path.GetFileNameWithoutExtension(_plyPath);
                 string assetPath = AssetDatabase.GenerateUniqueAssetPath($"{dir}/{baseName}_Proxy.asset");
 
@@ -614,10 +614,25 @@ namespace Splat2Play.Editor
             }
         }
 
+        /// <summary>逐级确保 Assets/... 目录存在(UPM 安装到空白工程时 Assets/Splat2Play 尚不存在)。</summary>
+        internal static void EnsureAssetFolder(string folderPath)
+        {
+            if (AssetDatabase.IsValidFolder(folderPath)) return;
+            string[] parts = folderPath.Split('/');
+            string cur = parts[0];
+            for (int i = 1; i < parts.Length; ++i)
+            {
+                string next = $"{cur}/{parts[i]}";
+                if (!AssetDatabase.IsValidFolder(next))
+                    AssetDatabase.CreateFolder(cur, parts[i]);
+                cur = next;
+            }
+        }
+
         ProxyBakeSettings CreateSettingsAsset()
         {
             string dir = "Assets/Splat2Play/Settings";
-            if (!AssetDatabase.IsValidFolder(dir)) AssetDatabase.CreateFolder("Assets/Splat2Play", "Settings");
+            EnsureAssetFolder(dir);
             var asset = ScriptableObject.CreateInstance<ProxyBakeSettings>();
             string path = AssetDatabase.GenerateUniqueAssetPath($"{dir}/ProxyBakeSettings.asset");
             AssetDatabase.CreateAsset(asset, path);

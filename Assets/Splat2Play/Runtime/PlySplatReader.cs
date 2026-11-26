@@ -129,6 +129,8 @@ namespace Splat2Play.Runtime
             try
             {
                 long total = (long)header.SplatCount * header.Stride;
+                if (total > int.MaxValue)
+                    throw new InvalidDataException($"PLY 顶点数据 {total / (1024.0 * 1024.0 * 1024.0):F2} GiB 超过单缓冲 2 GiB 上限,请先抽稀点数后再导入");
                 if (stream.Length - stream.Position < total)
                     throw new EndOfStreamException("PLY 顶点数据不完整");
 
@@ -170,6 +172,8 @@ namespace Splat2Play.Runtime
             try
             {
                 long total = (long)header.SplatCount * header.Stride;
+                if (total > int.MaxValue)
+                    throw new InvalidDataException($"PLY 顶点数据 {total / (1024.0 * 1024.0 * 1024.0):F2} GiB 超过单缓冲 2 GiB 上限,请先抽稀点数后再导入");
                 if (stream.Length - stream.Position < total)
                     throw new EndOfStreamException("PLY 顶点数据不完整");
 
@@ -209,6 +213,8 @@ namespace Splat2Play.Runtime
             try
             {
                 long total = (long)header.SplatCount * header.Stride;
+                if (total > int.MaxValue)
+                    throw new InvalidDataException($"PLY 顶点数据 {total / (1024.0 * 1024.0 * 1024.0):F2} GiB 超过单缓冲 2 GiB 上限,请先抽稀点数后再导入");
                 if (stream.Length - stream.Position < total)
                     throw new EndOfStreamException("PLY 顶点数据不完整");
 
