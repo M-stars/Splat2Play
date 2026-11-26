@@ -412,6 +412,7 @@ namespace GaussianSplatting.Runtime
                 {
                     useMipMap = true,
                     autoGenerateMips = false,
+                    enableRandomWrite = true,
                     msaaSamples = 1
                 };
                 m_HiZPyramid = new RenderTexture(desc)

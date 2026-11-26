@@ -103,6 +103,7 @@ namespace Splat2Play.Editor
             var cam = head.AddComponent<Camera>();
             cam.nearClipPlane = 0.05f;
             cam.tag = "MainCamera";
+            head.AddComponent<AudioListener>(); // M12 程序化脚步与碰撞音效需要场景中存在 AudioListener
             player.GetComponent<SplatFPSController>().CameraPivot = head.transform;
 
             var flashlight = head.AddComponent<Light>();
