@@ -521,10 +521,12 @@ namespace Splat2Play.Editor
                 AssetDatabase.CreateAsset(proxy, assetPath);
                 AssetDatabase.AddObjectToAsset(result.Mesh, proxy);
                 proxy.CollisionMesh = result.Mesh;
+                result.Mesh = null; // 转移所有权给持久子资产,防止 Dispose() 调用 DestroyImmediate 报红
                 if (result.NavigationMesh != null)
                 {
                     AssetDatabase.AddObjectToAsset(result.NavigationMesh, proxy);
                     proxy.NavigationMesh = result.NavigationMesh;
+                    result.NavigationMesh = null;
                 }
                 proxy.SceneBounds = result.SceneBounds;
                 proxy.SourceSplatCount = result.SplatCount;
@@ -569,8 +571,21 @@ namespace Splat2Play.Editor
                     if (go == null) go = new GameObject($"SplatLevel_{baseName}");
                     var renderer = go.GetComponent<GaussianSplatRenderer>();
                     if (renderer == null) renderer = go.AddComponent<GaussianSplatRenderer>();
-                    if (string.IsNullOrWhiteSpace(renderer.m_SourcePath))
-                        renderer.m_SourcePath = _plyPath; // ResolvePath 支持绝对路径
+                    bool srcMissing = string.IsNullOrWhiteSpace(renderer.m_SourcePath);
+                    if (!srcMissing)
+                    {
+                        try
+                        {
+                            string resolved = GaussianSplatReader.ResolvePath(Application.streamingAssetsPath, renderer.m_SourcePath);
+                            if (!GaussianSplatPaths.IsUrl(resolved) && !File.Exists(resolved)) srcMissing = true;
+                        }
+                        catch { srcMissing = true; }
+                    }
+                    if (srcMissing)
+                    {
+                        renderer.m_SourcePath = _plyPath; // 自动替换空路径或 scans/demo.ply 占位路径
+                        renderer.Reload();
+                    }
                     var level = go.GetComponent<SplatLevel>() ?? go.AddComponent<SplatLevel>();
                     level.SplatRenderer = renderer;
                     level.Proxy = proxy;

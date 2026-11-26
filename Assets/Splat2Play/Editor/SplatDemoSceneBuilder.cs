@@ -72,7 +72,7 @@ namespace Splat2Play.Editor
             // —— SplatLevel 根节点 ——
             var levelGo = new GameObject("SplatLevel_Scan");
             var renderer = levelGo.AddComponent<GaussianSplatRenderer>();
-            renderer.m_SourcePath = "scans/demo.ply"; // 占位;烘焙向导会写入实际路径
+            renderer.m_SourcePath = "";                // 留空由烘焙向导或 Inspector 填入,避免初始占位路径报红
             renderer.m_SHOrder = 2;                    // 首版性能保守值
             var level = levelGo.AddComponent<SplatLevel>();
             level.SplatRenderer = renderer;
